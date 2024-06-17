@@ -1,3 +1,75 @@
+// async function testTransferBuffer(device, obj) {
+//   const recurser = async (localObj) => {
+//     if (localObj.constructor.name === "GPUBuffer") {
+//       await localObj.mapAsync(GPUMapMode.READ, 0, localObj.size);
+//       const copyArrayBuffer = stagingBuffer.getMappedRange(0, localObj.size);
+//       console.log(copyArrayBuffer);
+//       const newBuffer = device.createBuffer({size: localObj.size, usage: localObj.usage});
+//       device.queue.writeBuffer(newBuffer, 0, copyArrayBuffer, 0, copyArrayBuffer.length);
+
+//     } else if (Array.isArray(localObj)) {
+//       return Promise.all(localObj.map(recurser));
+//     } else if (typeof localObj === "object") {
+//       return Object.fromEntries(await Promise.all(Object.entries(localObj).map(async ([k, v]) => [k, await recurser(v)])));
+//     } else {
+//       return localObj;
+//     }
+//   }
+//   const newObj = await recurser(obj);
+//   await device.queue.onSubmittedWorkDone();
+//   return newObj;
+// }
+
+async function serializeBuffer(device, buffer) {
+  if (buffer.usage & GPUBufferUsage.COPY_SRC === 0 || buffer.usage & GPUBufferUsage.COPY_DST === 0) {
+    throw new Error("Buffer is not copyable");
+  }
+  const stagingBuffer = device.createBuffer({
+    size: buffer.size,
+    usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST
+  });
+  const commandEncoder = device.createCommandEncoder();
+  commandEncoder.copyBufferToBuffer(buffer, 0, stagingBuffer, 0, buffer.size);
+  device.queue.submit([commandEncoder.finish()]);
+  await stagingBuffer.mapAsync(GPUMapMode.READ, 0, buffer.size);
+
+  const copyArrayBuffer = stagingBuffer.getMappedRange(0, buffer.size);
+  return {
+    _type: "GPUBuffer",
+    size: buffer.size,
+    usage: buffer.usage,
+    float32ArrayBuffer: new Float32Array(copyArrayBuffer).slice(0),
+  }
+}
+
+async function deserializeBuffer(device, buffer) {
+  if (buffer._type !== "GPUBuffer") throw new Error("Unexpected buffer type");
+  const resBuffer = device.createBuffer({
+    size: buffer.size,
+    usage: buffer.usage,
+  });
+  device.queue.writeBuffer(resBuffer, 0, buffer.float32ArrayBuffer, 0);
+  await device.queue.onSubmittedWorkDone();
+  return resBuffer;
+}
+
+async function runComputePasses(device, computePasses) {
+  const commandEncoder = device.createCommandEncoder();
+  for (const pass of computePasses) {
+    if (pass.flag === "compute") {
+      const passEncoder = commandEncoder.beginComputePass();
+      passEncoder.setPipeline(pass.pipeline);
+      for (let i = 0; i < pass.groups.length; i++) passEncoder.setBindGroup(i, pass.groups[i]);
+      passEncoder.dispatchWorkgroups(pass.workgroups.x, pass.workgroups.y);
+      passEncoder.end();
+    } else if (pass.flag === "copy") {
+      commandEncoder.copyBufferToBuffer(pass.src, pass.srcOffset, pass.dst, pass.dstOffset, pass.size);
+    }
+  }
+  device.queue.submit([commandEncoder.finish()]);
+  return await device.queue.onSubmittedWorkDone();
+}
+
 class GPT {
   constructor(folder, type) {
     this.folder = folder;
@@ -102,9 +174,10 @@ class GPT {
   }
 
   async run(idx) {
-    const { posEmbdBuffer, layer_buffers, normGammaBuffer, normBetaBuffer, embeddingsBuffers, deEmbeddingsBuffers } = this.model;
-    const { attention_scale, n_embd, n_head, head_size, n_layer, vocab_size, hidden_size, vocab_chunk_size, vocab_chunk_instances } = this.params;
+    const { posEmbdBuffer, normGammaBuffer, normBetaBuffer, embeddingsBuffers, deEmbeddingsBuffers } = this.model;
+    const { n_embd, n_layer, vocab_size, vocab_chunk_size, vocab_chunk_instances } = this.params;
     const seq_length = idx.length;
+    //const seq_length = 1024;
 
     // ---------------- Create Passes ---------------- //
     // Note: These are re-initialized because everytime seq_length changes buffers are different sizes.
@@ -120,94 +193,46 @@ class GPT {
       residualBuffer = resultBuffer;
       this.computePasses.push(...passes);
     }
-    for (let i = 0; i < n_layer; i++) {
-      const buffers = layer_buffers[i];
-      {
-        const { passes, resultBuffer } = LayerNormBlock.newInstance(
+    const midPoint = Math.floor(n_layer / 2);
+
+    if (true) {
+      // TEST: 1/2 Run locally
+      for (let i = 0; i < midPoint; i++) {
+        const resultBuffers = await this.runLayer({
+          layer: i,
           seq_length,
-          n_embd,
           intermediateBuffer,
-          buffers.normAttentionGammaBuffer,
-          buffers.normAttentionBetaBuffer
-        );
-        intermediateBuffer = resultBuffer;
-        this.computePasses.push(...passes);
+          residualBuffer,
+        })
+        intermediateBuffer = resultBuffers.intermediateBuffer;
+        residualBuffer = resultBuffers.residualBuffer;
       }
-      {
-        const { passes, resultBuffer } = AttentionBlock.newFusedInstance(
+      await runComputePasses(this.device, this.computePasses);
+      this.computePasses = [];
+
+      // TEST 2/2 Run remotely
+      const remoteResults = await this.runLayersOnOthers({
+        from: midPoint,
+        to: n_layer,
+        seq_length,
+        intermediateBuffer,
+        residualBuffer,
+      });
+      intermediateBuffer = remoteResults.intermediateBuffer;
+      residualBuffer = remoteResults.residualBuffer;
+    } else {
+      for (let i = 0; i < n_layer; i++) {
+        const resultBuffers = await this.runLayer({
+          layer: i,
           seq_length,
-          n_embd,
-          attention_scale,
-          n_head,
-          head_size,
           intermediateBuffer,
-          buffers.qkvWeightArray[0],
-          buffers.qkvBiasArray[0],
-          buffers.qkvWeightArray[1],
-          buffers.qkvBiasArray[1],
-          buffers.qkvWeightArray[2],
-          buffers.qkvBiasArray[2],
-          buffers.linearWeightsBuffer,
-          buffers.linearBiasBuffer,
-          FastMatMulBlock,
-          SoftmaxBlock
-        );
-        intermediateBuffer = resultBuffer;
-        this.computePasses.push(...passes);
-      }
-      {
-        const { passes, resultBuffer } = ResidualBlock.newInstance(seq_length, n_embd, intermediateBuffer, residualBuffer);
-        intermediateBuffer = resultBuffer;
-        residualBuffer = resultBuffer;
-        this.computePasses.push(...passes);
-      }
-      {
-        const { passes, resultBuffer } = LayerNormBlock.newInstance(
-          seq_length,
-          n_embd,
-          intermediateBuffer,
-          buffers.normLinearGammaBuffer,
-          buffers.normLinearBetaBuffer
-        );
-        intermediateBuffer = resultBuffer;
-        this.computePasses.push(...passes);
-      }
-      {
-        const { resultBuffer, passes } = FastMatMulBlock.newInstance(
-          seq_length,
-          hidden_size,
-          n_embd,
-          intermediateBuffer,
-          buffers.firstLayerWeightsBuffer,
-          buffers.firstLayerBiasBuffer
-        );
-        intermediateBuffer = resultBuffer;
-        this.computePasses.push(...passes);
-      }
-      {
-        const { resultBuffer, passes } = GeluBlock.newInstance(seq_length, hidden_size, intermediateBuffer);
-        intermediateBuffer = resultBuffer;
-        this.computePasses.push(...passes);
-      }
-      {
-        const { resultBuffer, passes } = FastMatMulBlock.newInstance(
-          seq_length,
-          n_embd,
-          hidden_size,
-          intermediateBuffer,
-          buffers.secondLayerWeightsBuffer,
-          buffers.secondLayerBiasBuffer
-        );
-        intermediateBuffer = resultBuffer;
-        this.computePasses.push(...passes);
-      }
-      {
-        const { passes, resultBuffer } = ResidualBlock.newInstance(seq_length, n_embd, intermediateBuffer, residualBuffer);
-        intermediateBuffer = resultBuffer;
-        residualBuffer = resultBuffer;
-        this.computePasses.push(...passes);
+          residualBuffer,
+        })
+        intermediateBuffer = resultBuffers.intermediateBuffer;
+        residualBuffer = resultBuffers.residualBuffer;
       }
     }
+
     {
       if (this.externalBuffer) {
         this.computePasses.push({
@@ -242,19 +267,8 @@ class GPT {
 
     // ---------------- Compute Passes ----------------
 
-    const commandEncoder = this.device.createCommandEncoder();
-    for (const pass of this.computePasses) {
-      if (pass.flag === "compute") {
-        const passEncoder = commandEncoder.beginComputePass();
-        passEncoder.setPipeline(pass.pipeline);
-        for (let i = 0; i < pass.groups.length; i++) passEncoder.setBindGroup(i, pass.groups[i]);
-        passEncoder.dispatchWorkgroups(pass.workgroups.x, pass.workgroups.y);
-        passEncoder.end();
-      } else if (pass.flag === "copy") {
-        commandEncoder.copyBufferToBuffer(pass.src, pass.srcOffset, pass.dst, pass.dstOffset, pass.size);
-      }
-    }
-    this.device.queue.submit([commandEncoder.finish()]);
+    await runComputePasses(this.device, this.computePasses);
+    
 
     // ---------------- Read Results ----------------
 
@@ -265,6 +279,156 @@ class GPT {
     clearOperationCache();
 
     return outputArray;
+  }
+
+  async runLayersForOthers({
+    from, to, seq_length, intermediateBufferSerialized, residualBufferSerialized
+  }) {
+    this.computePasses = [];
+    let intermediateBuffer = await deserializeBuffer(this.device, intermediateBufferSerialized);
+    let residualBuffer = await deserializeBuffer(this.device, residualBufferSerialized);
+    for (let i = from; i < to; i++) {
+      // const t0 = Date.now();
+      // const _buffers = layer_buffers[i];
+      // const buffers = await testTransferBuffer(this.device, _buffers);
+      const resultBuffers = await this.runLayer({
+        layer: i,
+        seq_length,
+        intermediateBuffer,
+        residualBuffer,
+      })
+      intermediateBuffer = resultBuffers.intermediateBuffer;
+      residualBuffer = resultBuffers.residualBuffer;
+    }
+    await runComputePasses(this.device, this.computePasses);
+    return {
+      intermediateBufferSerialized: await serializeBuffer(this.device, intermediateBuffer),
+      residualBufferSerialized: await serializeBuffer(this.device, residualBuffer),
+    }
+  }
+
+  async runLayersOnOthers({
+    from, to, seq_length, intermediateBuffer, residualBuffer
+  }) {
+    const {
+      intermediateBufferSerialized,
+      residualBufferSerialized
+    } = await window.computeNode.runLayersOnAnyNode({
+      from, to, seq_length,
+      intermediateBufferSerialized: await serializeBuffer(this.device, intermediateBuffer),
+      residualBufferSerialized: await serializeBuffer(this.device, residualBuffer),
+    });
+    return {
+      intermediateBuffer: await deserializeBuffer(this.device, intermediateBufferSerialized),
+      residualBuffer: await deserializeBuffer(this.device, residualBufferSerialized),
+    }
+  }
+
+  async runLayer({
+    layer, seq_length, intermediateBuffer, residualBuffer
+  }) {
+    const { layer_buffers } = this.model;
+    const { attention_scale, n_embd, n_head, head_size, hidden_size } = this.params;
+    const i = layer;
+    const buffers = layer_buffers[i];
+    // console.log('Data transfer overhead: ', Date.now() - t0, ' ms');
+    {
+      const { passes, resultBuffer } = LayerNormBlock.newInstance(
+        seq_length,
+        n_embd,
+        intermediateBuffer,
+        buffers.normAttentionGammaBuffer,
+        buffers.normAttentionBetaBuffer
+      );
+      intermediateBuffer = resultBuffer;
+      this.computePasses.push(...passes);
+    }
+    {
+      const { passes, resultBuffer } = AttentionBlock.newFusedInstance(
+        seq_length,
+        n_embd,
+        attention_scale,
+        n_head,
+        head_size,
+        intermediateBuffer,
+        buffers.qkvWeightArray[0],
+        buffers.qkvBiasArray[0],
+        buffers.qkvWeightArray[1],
+        buffers.qkvBiasArray[1],
+        buffers.qkvWeightArray[2],
+        buffers.qkvBiasArray[2],
+        buffers.linearWeightsBuffer,
+        buffers.linearBiasBuffer,
+        FastMatMulBlock,
+        SoftmaxBlock
+      );
+      intermediateBuffer = resultBuffer;
+      this.computePasses.push(...passes);
+    }
+    {
+      const { passes, resultBuffer } = ResidualBlock.newInstance(seq_length, n_embd, intermediateBuffer, residualBuffer);
+      intermediateBuffer = resultBuffer;
+      residualBuffer = resultBuffer;
+      this.computePasses.push(...passes);
+    }
+    {
+      const { passes, resultBuffer } = LayerNormBlock.newInstance(
+        seq_length,
+        n_embd,
+        intermediateBuffer,
+        buffers.normLinearGammaBuffer,
+        buffers.normLinearBetaBuffer
+      );
+      intermediateBuffer = resultBuffer;
+      this.computePasses.push(...passes);
+    }
+    {
+      const { resultBuffer, passes } = FastMatMulBlock.newInstance(
+        seq_length,
+        hidden_size,
+        n_embd,
+        intermediateBuffer,
+        buffers.firstLayerWeightsBuffer,
+        buffers.firstLayerBiasBuffer
+      );
+      intermediateBuffer = resultBuffer;
+      this.computePasses.push(...passes);
+    }
+    {
+      const { resultBuffer, passes } = GeluBlock.newInstance(seq_length, hidden_size, intermediateBuffer);
+      intermediateBuffer = resultBuffer;
+      this.computePasses.push(...passes);
+    }
+    {
+      const { resultBuffer, passes } = FastMatMulBlock.newInstance(
+        seq_length,
+        n_embd,
+        hidden_size,
+        intermediateBuffer,
+        buffers.secondLayerWeightsBuffer,
+        buffers.secondLayerBiasBuffer
+      );
+      intermediateBuffer = resultBuffer;
+      this.computePasses.push(...passes);
+    }
+    {
+      const { passes, resultBuffer } = ResidualBlock.newInstance(seq_length, n_embd, intermediateBuffer, residualBuffer);
+      intermediateBuffer = resultBuffer;
+      residualBuffer = resultBuffer;
+      this.computePasses.push(...passes);
+    }
+    // if (i % 2 === 0) {
+    //   await runComputePasses(this.device, this.computePasses);
+    //   this.computePasses = [];
+    //   const t0 = Date.now();
+    //   const sb1 = await serializeBuffer(this.device, intermediateBuffer);
+    //   const sb2 = await serializeBuffer(this.device, residualBuffer);
+    //   intermediateBuffer = await deserializeBuffer(this.device, sb1);
+    //   residualBuffer = await deserializeBuffer(this.device, sb2);
+    //   //console.log(sb);
+    //   console.log('Data serialize overhead: ', Date.now() - t0, ' ms');
+    // }
+    return { intermediateBuffer, residualBuffer };
   }
 
   async loadModel(folder) {

@@ -61,7 +61,7 @@ class Block {
       if (this.unboundBufferCache.get(key).length === 0) this.unboundBufferCache.delete(key);
       return buffer;
     }
-    return this.initBuffer(["storage", "copy_from"], dims, key);
+    return this.initBuffer(["storage", "copy_from", "copy_to"], dims, key);
   }
 
   initBuffer(ops, dims, key = "") {

@@ -2,10 +2,8 @@
 <html>
   <head>
     <title>WebGPU GPT Model Demo</title>
-    <meta
-      http-equiv="origin-trial"
-      content="Anx9P4m5tzLOL/wLICKy/mA+DRyoSsTkyqmnK5t+S7oyw7A2SeBI2jO4LKqoQiQgChP2MTtqMNKofelMwvGtPQsAAABKeyJvcmlnaW4iOiJodHRwczovL2ttZWFucy5vcmc6NDQzIiwiZmVhdHVyZSI6IldlYkdQVSIsImV4cGlyeSI6MTY5MTcxMTk5OX0="
-    />
+    <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+    <script src="p2p.js"></script>
     <script src="tokenizer.js"></script>
     <script src="instructions.js"></script>
     <script src="model.js"></script>
@@ -13,8 +11,14 @@
     <script src="globals.js"></script>
   </head>
   <body>
-    <h1>WebGPU GPT Model Demo</h1>
+    <h1>p2p WebGPU GPT Model Demo (CrowdGPT)</h1>
     <p id="webgpuSupportMessage">Checking WebGPU support...</p>
+    <p>Your peer id is: <span id="peerjsId">Loading...</span></p>
+    <label for="connectPeer">Connect to peer: webgpt-</label>
+    <input type="text" id="connectPeerId" />
+    <button onclick="connectPeer()">Connect</button>
+    <p>Peers:</p>
+    <pre id="peersList">loading...</pre>
     <p>
       <i>PS: Loading models is 5x slower on the web rather than running locally. Just <a href="https://github.com/0hq/WebGPT">clone the repo</a> and open!</i>
     </p>
@@ -80,6 +84,12 @@ Have you forgotten I built WebGPT?&#13;&#10;</textarea
         setModelButtonDisabled(false);
       }
 
+      function connectPeer() {
+        console.log("HIHIHIHI")
+        const peerId = 'webgpt-' + document.getElementById('connectPeerId').value;
+        window.computeNode.connectTo(peerId);
+      }
+
       async function startGeneration() {
         setTextareaDisabled(true);
 
@@ -103,6 +113,7 @@ Have you forgotten I built WebGPT?&#13;&#10;</textarea
 
         GPTModel = new GPT(folder, tokenizer);
         await GPTModel.initialize();
+        window.model = GPTModel;
 
 
         promptTextarea.value = GPTModel.defaultPrompt;
