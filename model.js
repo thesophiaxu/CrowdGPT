@@ -60,7 +60,7 @@ async function runComputePasses(device, computePasses) {
       const passEncoder = commandEncoder.beginComputePass();
       passEncoder.setPipeline(pass.pipeline);
       for (let i = 0; i < pass.groups.length; i++) passEncoder.setBindGroup(i, pass.groups[i]);
-      passEncoder.dispatchWorkgroups(pass.workgroups.x, pass.workgroups.y);
+      passEncoder.dispatchWorkgroups(pass.workgroups.x, pass.workgroups.y, pass.workgroups.z || undefined);
       passEncoder.end();
     } else if (pass.flag === "copy") {
       commandEncoder.copyBufferToBuffer(pass.src, pass.srcOffset, pass.dst, pass.dstOffset, pass.size);
@@ -176,6 +176,9 @@ class GPT {
   async run(idx) {
     const { posEmbdBuffer, normGammaBuffer, normBetaBuffer, embeddingsBuffers, deEmbeddingsBuffers } = this.model;
     const { n_embd, n_layer, vocab_size, vocab_chunk_size, vocab_chunk_instances } = this.params;
+    if (idx.length % 16 !== 0) {
+      idx = [...new Array(Math.ceil(idx.length / 16) * 16 - idx.length).fill(0), ...idx]
+    }
     const seq_length = idx.length;
     //const seq_length = 1024;
 
@@ -195,7 +198,7 @@ class GPT {
     }
     const midPoint = Math.floor(n_layer / 2);
 
-    if (true) {
+    if (false) {
       // TEST: 1/2 Run locally
       for (let i = 0; i < midPoint; i++) {
         const resultBuffers = await this.runLayer({
@@ -344,7 +347,7 @@ class GPT {
       this.computePasses.push(...passes);
     }
     {
-      const { passes, resultBuffer } = AttentionBlock.newFusedInstance(
+      const { passes, tmpBuffer, resultBuffer } = AttentionBlock.newFusedInstance(
         seq_length,
         n_embd,
         attention_scale,
@@ -364,6 +367,15 @@ class GPT {
       );
       intermediateBuffer = resultBuffer;
       this.computePasses.push(...passes);
+
+      // await runComputePasses(this.device, this.computePasses);
+      // this.computePasses = [];
+      // console.log(i);
+      // console.log(formatAsMatrix(
+      //   (await serializeBuffer(this.device, tmpBuffer)).float32ArrayBuffer,
+      //   seq_length,
+      //   head_size * n_head,
+      // ));
     }
     {
       const { passes, resultBuffer } = ResidualBlock.newInstance(seq_length, n_embd, intermediateBuffer, residualBuffer);
