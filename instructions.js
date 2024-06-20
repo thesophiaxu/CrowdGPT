@@ -1006,44 +1006,67 @@ class SoftmaxBackwardsClass extends Block {
     this.name = "softmax_backwards";
   }
 
-  newInstance(dOutputBuffer, rows, cols, inputBuffer) {
-
+  getPipeline() {
+    const pipelineCacheKey = `${this.name}_hihihi`;
+    if (this.pipelineCache.has(pipelineCacheKey)) return this.pipelineCache.get(pipelineCacheKey);
+    const pipeline = this.initPipeline(this.naiveShader, [this.u_s_Layout, this.r_r_Layout], `${this.name}_Pipeline_Div`);
+    this.pipelineCache.set(pipelineCacheKey, pipeline);
+    return pipeline;
   }
 
-// parallelize across t,b,h
-// __global__ void softmax_autoregressive_backward_kernel2(float* dpreatt, const float* datt, const float* att,
-//                                                      int B, int T, int C, int NH) {
-//     int t3 = blockIdx.x * blockDim.x + threadIdx.x;
-//     int idx = blockIdx.y * T * T;
-//     if (t3 >= T) { return; }
+  newInstance(dOutputBuffer, rows, cols, outputBuffer, scale) {
+    const pipeline = this.getPipeline();
+    const uniformBuffer = this.initUniform(4, [
+      [0, new Uint32Array([rows, cols])],
+      [8, new Float32Array([scale ?? 1.0])]
+    ]);
+    const resultBuffer = this.initBuffer(["storage", "copy_from"], [rows, cols]);
+    const bindGroup = this.initBindGroup(this.u_s_Layout, [uniformBuffer, resultBuffer], `${this.name}_OpG`);
+    const inputBindGroup = this.initBindGroup(this.r_r_Layout, [outputBuffer, dOutputBuffer])
+    const workgroups = { x: wgSize(rows, 1), y: 1, z: 1 };
 
-//     int hs = C / NH; // head size
-//     float scale = 1.0f / sqrtf(hs);
-//     for (int t = t3; t < T; t++) {
-//         float result = 0.0;
-//         const float* att_bth = att + idx + t*T;
-//         const float* datt_bth = datt + idx + t*T;
-//         float* dpreatt_bth = dpreatt + idx + t*T;
-
-//         for (int t2 = 0; t2 <= t; t2++) {
-//             float indicator = t2 == t3 ? 1.0f : 0.0f;
-//             float local_derivative = att_bth[t2] * (indicator - att_bth[t3]);
-//             result += scale * local_derivative * datt_bth[t2];
-//         }
-
-//         dpreatt_bth[t3] = result;
-//     }
-// }
+    return {
+      dInputBuffer: resultBuffer,
+      passes: [
+        {
+          flag: "compute",
+          pipeline: pipeline,
+          groups: [bindGroup, inputBindGroup],
+          workgroups: workgroups,
+        },
+      ],
+    };
+  }
 
   naiveShader = `
     struct Meta {
       M: u32,
       N: u32,
+      scale: f32,
     };
 
+    @group(0) @binding(0) var<uniform> uniforms: Meta;
+    @group(0) @binding(1) var<storage,read_write> dInput_array: array<f32>;
+
+    @group(1) @binding(0) var<storage,read> output_array: array<f32>;
+    @group(1) @binding(1) var<storage,read> dOutput_array: array<f32>;
+
     @compute @workgroup_size(16)
-    fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
-      
+    fn main(@builtin(workgroup_id) wg_id: vec3<u32>, @builtin(global_invocation_id) global_id: vec3<u32>) {
+      let i: u32 = wg_id.x;
+      let N: u32 = uniforms.N;
+      for (var j: u32 = 0u; j < N; j = j + 1u) {
+        var result: f32 = 0.0f;
+
+        for (var k: u32 = 0u; k < N; k = k + 1u) {
+          var ind: f32 = 0.0f;
+          if (j == k) { ind = 1.0f; }
+          let dLocal = output_array[i * N + j] * (ind - output_array[i * N + k]);
+          result += dLocal * dOutput_array[i * N + k];
+        }
+
+        dInput_array[i * N + j] = result * uniforms.scale;
+      }
     }
   `
 }
@@ -1428,7 +1451,8 @@ class AttentionBlockClass extends Block {
     const attentionWeightsInputBindGroup = this.initBindGroup(this.r_r_Layout, [formatQResultBuffer, KResultBuffer], `${this.name}_AttentionWeightsInputG`);
     const attentionWeightsWorkgroups = { x: wgSize(seq_length, 8), y: wgSize(seq_length * n_head, 8), z: 1 };
 
-    const { resultBuffer: softmaxOutputBuffer, passes: softmaxPasses } = SoftmaxBlock.newInstance(
+    const { resultBuffer: softmaxOutputBuffer // number_of_heads x seq_length x seq_length
+      , passes: softmaxPasses } = SoftmaxBlock.newInstance(
       seq_length * n_head,
       seq_length,
       attentionWeightsResultBuffer
@@ -1439,15 +1463,16 @@ class AttentionBlockClass extends Block {
     } = TransposeBlock.newInstance(
       n_head,
       head_size,
-      VResultBuffer,
+      VResultBuffer, // seq_length x number_of_heads x head_size
       seq_length
     )
     const {
-      resultBuffer: VResultBuffer_T, passes: attentionValueTranspose2Passes
+      resultBuffer: VResultBuffer_T, // number_of_heads x seq_length x head_size
+      passes: attentionValueTranspose2Passes
     } = TransposeBlock.newInstance(
       seq_length * head_size,
       n_head,
-      VResultBuffer_T1,
+      VResultBuffer_T1, // seq_length x head_size x number_of_heads
     )
     const {
       resultBuffer: attentionValuesResultBuffer, passes: attentionValuesPasses
@@ -1455,8 +1480,8 @@ class AttentionBlockClass extends Block {
       seq_length,
       head_size,
       seq_length,
-      softmaxOutputBuffer,
-      VResultBuffer_T,
+      softmaxOutputBuffer, // number_of_heads x seq_length x seq_length
+      VResultBuffer_T, // number_of_heads x seq_length x head_size
       undefined,
       n_head
     )
@@ -1795,7 +1820,7 @@ class AttentionBackwardsClass extends Block {
     SoftmaxBlock
   ) {
     const {
-      dInputBuffer: dAttentionOutputBuffer,
+      dInputBuffer: dAttentionOutputBuffer, // seq_length x number_of_heads x head_size
       dWeightsBuffer: dLinearWeightsBuffer,
       dBiasBuffer: dLinearBiasBuffer,
       passes: MLPOutputPasses
@@ -1809,11 +1834,192 @@ class AttentionBackwardsClass extends Block {
       linearBiasBuffer,
     )
 
-    throw new Error("Not implemented")
+    const {
+      resultBuffer: dAttentionOutputBuffer_T1, // seq_length x head_size x number_of_heads
+      passes: dAttentionValueTranspose1Passes
+    } = TransposeBlock.newInstance(
+      n_head,
+      head_size,
+      dAttentionOutputBuffer,
+      seq_length
+    )
+    const {
+      resultBuffer: dAttentionOutputBuffer_T2, // number_of_heads x seq_length x head_size
+      passes: dAttentionValueTranspose2Passes,
+    } = TransposeBlock.newInstance(
+      head_size * seq_length,
+      n_head,
+      dAttentionOutputBuffer_T1,
+    )
 
-    // const {} = FastMatMulBackwards.newInstance(
-    //   dAttentionOutputBuffer,
 
-    // )
+    const {
+      resultBuffer: dAttentionSoftmaxOutputsBuffer, // number_of_heads x seq_length x seq_length
+    } = FastMatMulBatchedBlock.newInstance(
+      seq_length,
+      seq_length,
+      head_size,
+      dAttentionOutputBuffer_T2, // number_of_heads x seq_length x head_size
+      caches.VResultsBuffer, // number_of_heads x head_size x seq_length
+      n_head
+    )
+
+    const {
+      resultBuffer: attentionSoftmaxOutputsBuffer_TX, // number_of_heads x seq_length x seq_length
+      passes: attentionSoftmaxOutputTransposePasses,
+    } = TransposeBlock.newInstance(
+      seq_length,
+      seq_length,
+      caches.attentionSoftmaxOutputsBuffer, // number_of_heads x seq_length x seq_length
+      n_head,
+    )
+
+    const {
+      resultBuffer: dAttentionVResultBuffer_Tprime, // number_of_heads x seq_length x head_size
+    } = FastMatMulBatchedBlock.newInstance(
+      seq_length,
+      head_size,
+      seq_length,
+      attentionSoftmaxOutputsBuffer_TX, // number_of_heads x seq_length x seq_length
+      dAttentionOutputBuffer_T2, // number_of_heads x seq_length x head_size
+      n_head,
+    )
+
+    const {
+      resultBuffer: dAttentionVResultBuffer_T, // seq_length x head_size x number_of_heads
+      passes: attentionValueTranspose2Passes
+    } = TransposeBlock.newInstance(
+      n_head,
+      seq_length * head_size,
+      dAttentionVResultBuffer_Tprime, // number_of_heads x seq_length x head_size
+    )
+
+    const {
+      resultBuffer: dAttentionVResultBuffer, // seq_length x number_of_heads x head_size
+      passes: attentionValueTranspose3Passes,
+    } = TransposeBlock.newInstance(
+      head_size,
+      n_head,
+      dAttentionVResultBuffer_T, // seq_length x head_size x number_of_heads
+      seq_length
+    )
+
+    const {
+      dInputBuffer: dInputBuffer_VComponent, // seq_length x n_embd ()
+      dWeightsBuffer: dVWeightsBuffer, // n_embd x n_embd
+      dBiasBuffer: dVBiasBuffer, // n_embd
+      passes: vMatmulBackwardsPasses,
+    } = FastMatMulBackwards.newInstance(
+      dAttentionVResultBuffer, // seq_length x number_of_heads x head_size
+      seq_length,
+      n_embd,
+      n_embd,
+      inputBuffer,
+      vWeightsBuffer,
+      vBiasBuffer,
+    );
+
+    const {
+      resultBuffer: dAttentionWeightsResultBuffer, // number_of_heads x seq_length x seq_length
+      passes: attentionSoftmaxBackwardsPasses,
+    } = SoftmaxBackwards.newInstance(
+      dAttentionSoftmaxOutputsBuffer, // number_of_heads x seq_length x seq_length
+      n_head * seq_length,
+      seq_length,
+      caches.attentionSoftmaxOutputsBuffer, // number_of_heads x seq_length x seq_length
+      attentionDotProductScale,
+    );
+
+    const {
+      resultBuffer: dQResultBuffer, // number_of_heads x seq_length x head_size
+    } = FastMatMulBatchedBlock.newInstance(
+      seq_length,
+      head_size,
+      seq_length,
+      dAttentionWeightsResultBuffer, // number_of_heads x seq_length x seq_length
+      KResultBuffer_TX, // number_of_heads x seq_length x head_size
+      n_head
+    )
+
+    const {
+      resultBuffer: dK_TResultBuffer, // number_of_heads x head_size x seq_length
+    } = FastMatMulBatchedBlock.newInstance(
+      head_size,
+      seq_length,
+      seq_length,
+      QResultBuffer_TX, // number_of_heads x head_size x seq_length
+      dAttentionWeightsResultBuffer, // number_of_heads x seq_length x seq_length
+      n_head
+    )
+
+    const {
+      resultBuffer: dQResultBuffer_T, // seq_length x head_size x number_of_heads
+      passes: attentionQT1Passes
+    } = TransposeBlock.newInstance(
+      n_head,
+      seq_length * head_size,
+      dQResultBuffer, // number_of_heads x seq_length x head_size
+    )
+
+    const {
+      resultBuffer: dQResultBuffer_TT, // seq_length x number_of_heads x head_size
+      passes: attentionQT2Passes,
+    } = TransposeBlock.newInstance(
+      head_size,
+      n_head,
+      dQResultBuffer_T, // seq_length x head_size x number_of_heads
+      seq_length
+    )
+
+    const {
+      dInputBuffer: dInputBuffer_QComponent, // seq_length x n_embd ()
+      dWeightsBuffer: dQWeightsBuffer, // n_embd x n_embd
+      dBiasBuffer: dQBiasBuffer, // n_embd
+      passes: qMatmulBackwardsPasses,
+    } = FastMatMulBackwards.newInstance(
+      dQResultBuffer_TT, // seq_length x number_of_heads x head_size
+      seq_length,
+      n_embd,
+      n_embd,
+      inputBuffer,
+      qWeightsBuffer,
+      qBiasBuffer,
+    );
+
+    const {
+      resultBuffer: dKResultBuffer_T, // seq_length x number_of_heads x head_size
+      passes: attentionKT1Passes,
+    } = TransposeBlock.newInstance(
+      n_head * head_size,
+      seq_length,
+      dK_TResultBuffer, // number_of_heads x head_size x seq_length
+    )
+
+    const {
+      dInputBuffer: dInputBuffer_KComponent, // seq_length x n_embd ()
+      dWeightsBuffer: dKWeightsBuffer, // n_embd x n_embd
+      dBiasBuffer: dKBiasBuffer, // n_embd
+      passes: kMatmulBackwardsPasses,
+    } = FastMatMulBackwards.newInstance(
+      dKResultBuffer_T, // seq_length x number_of_heads x head_size
+      seq_length,
+      n_embd,
+      n_embd,
+      inputBuffer,
+      kWeightsBuffer,
+      kBiasBuffer,
+    );
+
+    return {
+      dInputBuffer,
+      dQWeightsBuffer,
+      dKWeightsBuffer,
+      dVWeightsBuffer,
+      dQBiasBuffer,
+      dKBiasBuffer,
+      dVBiasBuffer,
+      dLinearWeightsBuffer,
+      dLinearBiasBuffer,
+    }
   }
 }
