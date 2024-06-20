@@ -1000,6 +1000,54 @@ class SoftmaxBlockClass extends Block {
   }
 }
 
+class SoftmaxBackwardsClass extends Block {
+  constructor() {
+    super();
+    this.name = "softmax_backwards";
+  }
+
+  newInstance(dOutputBuffer, rows, cols, inputBuffer) {
+
+  }
+
+// parallelize across t,b,h
+// __global__ void softmax_autoregressive_backward_kernel2(float* dpreatt, const float* datt, const float* att,
+//                                                      int B, int T, int C, int NH) {
+//     int t3 = blockIdx.x * blockDim.x + threadIdx.x;
+//     int idx = blockIdx.y * T * T;
+//     if (t3 >= T) { return; }
+
+//     int hs = C / NH; // head size
+//     float scale = 1.0f / sqrtf(hs);
+//     for (int t = t3; t < T; t++) {
+//         float result = 0.0;
+//         const float* att_bth = att + idx + t*T;
+//         const float* datt_bth = datt + idx + t*T;
+//         float* dpreatt_bth = dpreatt + idx + t*T;
+
+//         for (int t2 = 0; t2 <= t; t2++) {
+//             float indicator = t2 == t3 ? 1.0f : 0.0f;
+//             float local_derivative = att_bth[t2] * (indicator - att_bth[t3]);
+//             result += scale * local_derivative * datt_bth[t2];
+//         }
+
+//         dpreatt_bth[t3] = result;
+//     }
+// }
+
+  naiveShader = `
+    struct Meta {
+      M: u32,
+      N: u32,
+    };
+
+    @compute @workgroup_size(16)
+    fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
+      
+    }
+  `
+}
+
 class GeluBlockClass extends Block {
   constructor() {
     super();
