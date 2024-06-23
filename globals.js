@@ -2,6 +2,7 @@ const FastMatMulBlock = new FastMatMulBlockClass();
 const FastMatMulBatchedBlock = new FastMatMulBlockBatchedClass();
 const FastMatMulBackwards = new FastMatMulBackwardsClass();
 const AttentionBlock = new AttentionBlockClass();
+const AttentionBackwards = new AttentionBackwardsClass();
 const ResidualBlock = new ResidualBlockClass();
 const EmbedBlock = new EmbedBlockClass();
 const DeEmbedBlock = new DeEmbedBlockClass();
@@ -10,9 +11,13 @@ const LayerNormBlock = new LayerNormBlockClass();
 const SoftmaxBlock = new SoftmaxBlockClass();
 const SoftmaxBackwards = new SoftmaxBackwardsClass();
 const TransposeBlock = new TransposeBlockClass();
+const CrossEntropyLoss = new CrossEntropyLossClass();
+const CrossEntropyBackwards = new CrossEntropyBackwardsClass();
 
 // Needed for deletion.
-let operations = [FastMatMulBlock, FastMatMulBatchedBlock, FastMatMulBackwards, AttentionBlock, ResidualBlock, EmbedBlock, DeEmbedBlock, GeluBlock, LayerNormBlock, SoftmaxBlock, SoftmaxBackwards, TransposeBlock];
+let operations = [FastMatMulBlock, FastMatMulBatchedBlock, FastMatMulBackwards, AttentionBlock, AttentionBackwards,
+  ResidualBlock, EmbedBlock, DeEmbedBlock, GeluBlock, LayerNormBlock, SoftmaxBlock, SoftmaxBackwards, TransposeBlock,
+  CrossEntropyLoss, CrossEntropyBackwards];
 
 function initializeOperations(device) {
   for (const operation of operations) operation.initialize(device);

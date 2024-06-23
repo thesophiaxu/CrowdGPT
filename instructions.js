@@ -1475,6 +1475,15 @@ class AttentionBlockClass extends Block {
       VResultBuffer_T1, // seq_length x head_size x number_of_heads
     )
     const {
+      resultBuffer: VResultBuffer_TBack, // number_of_heads x head_size x seq_length
+      passes: attentionValueTranspose2xPasses
+    } = TransposeBlock.newInstance(
+      seq_length,
+      head_size,
+      VResultBuffer_T, // number_of_heads x seq_length x head_size,
+      n_head
+    )
+    const {
       resultBuffer: attentionValuesResultBuffer, passes: attentionValuesPasses
     } = FastMatMulBatchedBlock.newInstance(
       seq_length,
@@ -1512,6 +1521,14 @@ class AttentionBlockClass extends Block {
 
     return {
       resultBuffer: linearMLPResult,
+      caches: {
+        attentionValuesResultBuffer: attentionValuesResultBuffer_T,
+        VResultsBuffer: VResultBuffer_TBack,
+        attentionSoftmaxOutputsBuffer: softmaxOutputBuffer,
+        QResultBuffer, // seq_length x number_of_heads x head_size
+        KResultBuffer,
+        VResultBuffer,
+      },
       passes: [
         ...QMLPPasses,
         ...KMLPPasses,
@@ -1531,6 +1548,7 @@ class AttentionBlockClass extends Block {
         ...softmaxPasses,
         ...attentionValueTranspose1Passes,
         ...attentionValueTranspose2Passes,
+        ...attentionValueTranspose2xPasses,
         ...attentionValuesPasses,
         ...attentionValueTranspose3Passes,
         ...attentionValueTranspose4Passes,
@@ -1748,7 +1766,7 @@ class AttentionBlockClass extends Block {
       // Causal attention step.
       let rowMask: u32 = row % N;
       let causalMask: bool = (col <= rowMask);
-      result_array[row * N + col] = select(-1e9, sum * uniforms.attentionScale, causalMask);
+      result_array[row * N + col] = select(-1e12, sum * uniforms.attentionScale, causalMask);
     }
   `;
 
@@ -1800,17 +1818,55 @@ class AttentionBackwardsClass extends Block {
     this.name = "attention_backwards";
   }
 
+  maskNaiveShader = `
+    struct Meta {
+      M: u32,
+      N: u32,
+    }
+
+    @group(0) @binding(0) var<uniform> uniforms: Meta;
+    @group(0) @binding(1) var<storage, read_write> result_array: array<f32>;
+
+    @group(1) @binding(0) var<storage, read> values_array: array<f32>;
+
+    @compute @workgroup_size(1)
+    fn main (@builtin(global_invocation_id) global_id: vec3<u32>) {
+      var M: u32 = uniforms.M;
+      var N: u32 = uniforms.N;
+      var row: u32 = global_id.x;
+      var col: u32 = global_id.y;
+      var idx: u32 = global_id.z;
+
+      if (row > M || col > N) {
+        return;
+      }
+
+      let causalMask: bool = row >= col;
+      result_array[idx * M * N + row * N + col] = select(0, values_array[idx * M * N + row * N + col], causalMask);
+      //result_array[idx * M * N + row * N + col] = values_array[idx * M * N + row * N + col];
+    }
+  `
+
+  getCausalMaskPipeline() {
+    const pipelineCacheKey = `${this.name}_mask`; // No param optimization.
+    if (this.pipelineCache.has(pipelineCacheKey)) return this.pipelineCache.get(pipelineCacheKey);
+    const pipeline = this.initPipeline(this.maskNaiveShader, [this.u_s_Layout, this.r_Layout], `${this.name}_Pipeline_mask`);
+    this.pipelineCache.set(pipelineCacheKey, pipeline);
+    return pipeline;
+  }
+
   newInstance(
     dOutputBuffer,
+    caches,
     seq_length,
     n_embd,
     attentionDotProductScale,
     n_head,
     head_size,
-    inputBuffer,
-    qWeightsBuffer,
+    inputBuffer, // seq_length x n_embd
+    qWeightsBuffer, // n_embd x n_embd
     qBiasBuffer,
-    kWeightsBuffer,
+    kWeightsBuffer, // n_embd x n_embd
     kBiasBuffer,
     vWeightsBuffer,
     vBiasBuffer,
@@ -1829,7 +1885,7 @@ class AttentionBackwardsClass extends Block {
       seq_length,
       n_embd,
       n_embd,
-      attentionValuesResultBuffer,
+      caches.attentionValuesResultBuffer, // seq_length x n_embd
       linearWeightsBuffer,
       linearBiasBuffer,
     )
@@ -1852,17 +1908,33 @@ class AttentionBackwardsClass extends Block {
       dAttentionOutputBuffer_T1,
     )
 
-
     const {
-      resultBuffer: dAttentionSoftmaxOutputsBuffer, // number_of_heads x seq_length x seq_length
+      resultBuffer: dAttentionSoftmaxOutputsBufferMasked, // number_of_heads x seq_length x seq_length
+      passes: attentionGetSoftmaxOutputsPasses,
     } = FastMatMulBatchedBlock.newInstance(
       seq_length,
       seq_length,
       head_size,
       dAttentionOutputBuffer_T2, // number_of_heads x seq_length x head_size
       caches.VResultsBuffer, // number_of_heads x head_size x seq_length
+      undefined,
       n_head
     )
+
+    const maskerPipeline = this.getCausalMaskPipeline();
+    const maskersUniformBuffer = this.initUniform(2, [[0, new Uint32Array([seq_length, seq_length])]]);
+    const dAttentionSoftmaxOutputsBuffer = this.initResultBuffer([n_head, seq_length, seq_length]);
+    const maskerBindGroup = this.initBindGroup(this.u_s_Layout, [maskersUniformBuffer, dAttentionSoftmaxOutputsBuffer]);
+    const maskerInputBindGroup = this.initBindGroup(this.r_Layout, [dAttentionSoftmaxOutputsBufferMasked], `${this.name}_input`);
+    const maskerWorkgroups = { x: wgSize(seq_length, 1), y: wgSize(seq_length, 1), z: n_head };
+    const maskerPasses = [
+      {
+        flag: "compute",
+        pipeline: maskerPipeline,
+        groups: [maskerBindGroup, maskerInputBindGroup],
+        workgroups: maskerWorkgroups,
+      }
+    ]
 
     const {
       resultBuffer: attentionSoftmaxOutputsBuffer_TX, // number_of_heads x seq_length x seq_length
@@ -1876,12 +1948,14 @@ class AttentionBackwardsClass extends Block {
 
     const {
       resultBuffer: dAttentionVResultBuffer_Tprime, // number_of_heads x seq_length x head_size
+      passes: attentionGetDVPasses,
     } = FastMatMulBatchedBlock.newInstance(
       seq_length,
       head_size,
       seq_length,
       attentionSoftmaxOutputsBuffer_TX, // number_of_heads x seq_length x seq_length
       dAttentionOutputBuffer_T2, // number_of_heads x seq_length x head_size
+      undefined,
       n_head,
     )
 
@@ -1920,7 +1994,7 @@ class AttentionBackwardsClass extends Block {
     );
 
     const {
-      resultBuffer: dAttentionWeightsResultBuffer, // number_of_heads x seq_length x seq_length
+      dInputBuffer: dAttentionWeightsResultBuffer, // number_of_heads x seq_length x seq_length
       passes: attentionSoftmaxBackwardsPasses,
     } = SoftmaxBackwards.newInstance(
       dAttentionSoftmaxOutputsBuffer, // number_of_heads x seq_length x seq_length
@@ -1931,24 +2005,56 @@ class AttentionBackwardsClass extends Block {
     );
 
     const {
+      resultBuffer: KResultBuffer_T, // number_of_heads x head_size x seq_length
+      passes: KResultBufferTPasses,
+    } = TransposeBlock.newInstance(
+      seq_length,
+      n_head * head_size,
+      caches.KResultBuffer, // seq_length x number_of_heads x head_size
+    )
+
+    const {
+      resultBuffer: KResultBuffer_TX, // number_of_heads x seq_length x head_size
+      passes: KResultBufferTXPasses,
+    } = TransposeBlock.newInstance(
+      head_size,
+      seq_length,
+      KResultBuffer_T, // number_of_heads x head_size x seq_length
+      n_head
+    )
+
+    const {
       resultBuffer: dQResultBuffer, // number_of_heads x seq_length x head_size
+      passes: attentionGetDQPasses,
     } = FastMatMulBatchedBlock.newInstance(
       seq_length,
       head_size,
       seq_length,
       dAttentionWeightsResultBuffer, // number_of_heads x seq_length x seq_length
       KResultBuffer_TX, // number_of_heads x seq_length x head_size
+      undefined,
       n_head
     )
 
     const {
+      resultBuffer: QResultBuffer_TX, // number_of_heads x head_size x seq_length
+      passes: QResultBufferTPasses,
+    } = TransposeBlock.newInstance(
+      seq_length,
+      n_head * head_size,
+      caches.QResultBuffer, // seq_length x number_of_heads x head_size
+    )
+
+    const {
       resultBuffer: dK_TResultBuffer, // number_of_heads x head_size x seq_length
+      passes: attentionGetDKPasses,
     } = FastMatMulBatchedBlock.newInstance(
       head_size,
       seq_length,
       seq_length,
       QResultBuffer_TX, // number_of_heads x head_size x seq_length
       dAttentionWeightsResultBuffer, // number_of_heads x seq_length x seq_length
+      undefined,
       n_head
     )
 
@@ -2010,6 +2116,26 @@ class AttentionBackwardsClass extends Block {
       kBiasBuffer,
     );
 
+    const {
+      resultBuffer: dInputBuffer_QKComponent,
+      passes: sumBack1Passes,
+    } = ResidualBlock.newInstance(
+      seq_length,
+      n_embd,
+      dInputBuffer_QComponent,
+      dInputBuffer_KComponent,
+    )
+
+    const {
+      resultBuffer: dInputBuffer,
+      passes: sumBack2Passes,
+    } = ResidualBlock.newInstance(
+      seq_length,
+      n_embd,
+      dInputBuffer_QKComponent,
+      dInputBuffer_VComponent,
+    )
+
     return {
       dInputBuffer,
       dQWeightsBuffer,
@@ -2019,7 +2145,212 @@ class AttentionBackwardsClass extends Block {
       dKBiasBuffer,
       dVBiasBuffer,
       dLinearWeightsBuffer,
+      dAttentionSoftmaxOutputsBufferMasked,
+      dAttentionSoftmaxOutputsBuffer,
       dLinearBiasBuffer,
+      passes: [
+        MLPOutputPasses,
+        dAttentionValueTranspose1Passes,
+        dAttentionValueTranspose2Passes,
+        attentionGetSoftmaxOutputsPasses,
+        maskerPasses,
+        attentionSoftmaxOutputTransposePasses,
+        attentionGetDVPasses,
+        attentionValueTranspose2Passes,
+        attentionValueTranspose3Passes,
+        vMatmulBackwardsPasses,
+        attentionSoftmaxBackwardsPasses,
+        KResultBufferTPasses,
+        KResultBufferTXPasses,
+        QResultBufferTPasses,
+        attentionGetDQPasses,
+        attentionGetDKPasses,
+        attentionQT1Passes,
+        attentionQT2Passes,
+        qMatmulBackwardsPasses,
+        attentionKT1Passes,
+        kMatmulBackwardsPasses,
+        sumBack1Passes,
+        sumBack2Passes,
+      ].flat()
+    }
+  }
+}
+
+class CrossEntropyLossClass extends Block {
+  constructor() {
+    super();
+    this.name = "crossentropy";
+  }
+
+
+  // __global__ void crossentropy_forward_kernel1(float* losses,
+  //                           const float* probs, const int* targets,
+  //                           int B, int T, int V) {
+  //   int i = blockIdx.x * blockDim.x + threadIdx.x;
+  //   if (i < B * T) {
+  //       int b = i / T;
+  //       int t = i % T;
+  //       const float* probs_bt = probs + b * T * V + t * V;
+  //       int ix = targets[b * T + t];
+  //       losses[b * T + t] = -logf(probs_bt[ix]);
+  //   }
+  // }
+
+  crossEntropyShader = `
+    struct Meta {
+      N: u32,
+    }
+
+    @group(0) @binding(0) var<uniform> uniforms: Meta;
+    @group(0) @binding(1) var<storage, read_write> losses_array: array<f32>;
+
+    @group(1) @binding(0) var<storage, read> probs_array: array<f32>;
+    @group(1) @binding(1) var<storage, read> targets_array: array<u32>;
+
+    @compute @workgroup_size(8)
+    fn main (@builtin(global_invocation_id) global_id: vec3<u32>) {
+      let i: u32 = global_id.x;
+      let N: u32 = uniforms.N;
+      
+      if (i < N) {
+        let ix: u32 = targets_array[i];
+        losses_array[i] = -log(probs_array[i * N + ix]);
+      }
+    }
+  
+  `
+
+  getPipeline() {
+    const pipelineCacheKey = `${this.name}_`; // No param optimization.
+    if (this.pipelineCache.has(pipelineCacheKey)) return this.pipelineCache.get(pipelineCacheKey);
+    const pipeline = this.initPipeline(this.crossEntropyShader, [this.u_s_Layout, this.r_r_Layout], `${this.name}_Pipeline`);
+    this.pipelineCache.set(pipelineCacheKey, pipeline);
+    return pipeline;
+  }
+
+  newInstance(
+    seq_length,
+    vocab_size,
+    logits,
+    target,
+  ) {
+    const { resultBuffer: logitsSoftmaxed, passes: softmaxPasses } = SoftmaxBlock.newInstance(
+      seq_length,
+      vocab_size,
+      logits
+    )
+
+    const myPipeline = this.getPipeline();
+    const myUniformBuffer = this.initUniform(1, [[0, new Uint32Array([vocab_size])]]);
+    const lossesBuffer = this.initResultBuffer([seq_length]);
+    const myBindGroup = this.initBindGroup(this.u_s_Layout, [myUniformBuffer, lossesBuffer]);
+    const myInputBindGroup = this.initBindGroup(this.r_r_Layout, [logitsSoftmaxed, target], `${this.name}_input`);
+    const myWorkgroups = { x: seq_length, y: 1, z: 1 };
+
+    return {
+      resultBuffer: lossesBuffer,
+      caches: {
+        probsBuffer: logitsSoftmaxed,
+      },
+      passes: [
+        ...softmaxPasses,
+        {
+          flag: "compute",
+          pipeline: myPipeline,
+          groups: [myBindGroup, myInputBindGroup],
+          workgroups: myWorkgroups,
+        }
+      ]
+    }
+  }
+}
+
+class CrossEntropyBackwardsClass extends Block {
+  constructor() {
+    super();
+    this.name = "crossentropy_backw";
+  }
+
+
+  // __global__ void crossentropy_forward_kernel1(float* losses,
+  //                           const float* probs, const int* targets,
+  //                           int B, int T, int V) {
+  //   int i = blockIdx.x * blockDim.x + threadIdx.x;
+  //   if (i < B * T) {
+  //       int b = i / T;
+  //       int t = i % T;
+  //       const float* probs_bt = probs + b * T * V + t * V;
+  //       int ix = targets[b * T + t];
+  //       losses[b * T + t] = -logf(probs_bt[ix]);
+  //   }
+  // }
+
+  crossEntropyShader = `
+    struct Meta {
+      M: u32,
+      N: u32,
+    }
+
+    @group(0) @binding(0) var<uniform> uniforms: Meta;
+    @group(0) @binding(1) var<storage, read_write> dlogits_array: array<f32>;
+
+    @group(1) @binding(0) var<storage, read> probs_array: array<f32>;
+    @group(1) @binding(1) var<storage, read> targets_array: array<u32>;
+    @group(1) @binding(2) var<storage, read> dlosses_array: array<f32>;
+
+    @compute @workgroup_size(8, 8)
+    fn main (@builtin(local_invocation_id) local_id: vec3<u32>, @builtin(workgroup_id) workgroup_id: vec3<u32>) {
+      let t: u32 = workgroup_id.x * 8 + local_id.x;
+      let v: u32 = workgroup_id.y * 8 + local_id.y;
+
+      let M: u32 = uniforms.M;
+      let N: u32 = uniforms.N;
+      
+      if (t < M && v < N) {
+        let dloss: f32 = dlosses_array[t];
+        let ix: u32 = targets_array[t];
+        let p: f32 = probs_array[t * N + v];
+        let indicator: f32 = select(0.0f, 1.0f, v == ix);
+        dlogits_array[t * N + v] = (p - indicator) * dloss;
+      }
+    }
+  
+  `
+
+  getPipeline() {
+    const pipelineCacheKey = `${this.name}_`; // No param optimization.
+    if (this.pipelineCache.has(pipelineCacheKey)) return this.pipelineCache.get(pipelineCacheKey);
+    const pipeline = this.initPipeline(this.crossEntropyShader, [this.u_s_Layout, this.r_r_r_Layout], `${this.name}_Pipeline`);
+    this.pipelineCache.set(pipelineCacheKey, pipeline);
+    return pipeline;
+  }
+
+  newInstance(
+    dLosses,
+    caches,
+    seq_length,
+    vocab_size,
+    logits,
+    target,
+  ) {
+    const myPipeline = this.getPipeline();
+    const myUniformBuffer = this.initUniform(2, [[0, new Uint32Array([seq_length, vocab_size])]]);
+    const dLogitsBuffer = this.initResultBuffer([seq_length, vocab_size]);
+    const myBindGroup = this.initBindGroup(this.u_s_Layout, [myUniformBuffer, dLogitsBuffer]);
+    const myInputBindGroup = this.initBindGroup(this.r_r_r_Layout, [caches.probsBuffer, target, dLosses], `${this.name}_input`);
+    const myWorkgroups = { x: wgSize(seq_length, 8), y: wgSize(vocab_size, 8), z: 1 };
+
+    return {
+      dLogitsBuffer,
+      passes: [
+        {
+          flag: "compute",
+          pipeline: myPipeline,
+          groups: [myBindGroup, myInputBindGroup],
+          workgroups: myWorkgroups,
+        }
+      ]
     }
   }
 }

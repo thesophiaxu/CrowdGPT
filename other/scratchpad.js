@@ -387,6 +387,40 @@ class TestGPT {
     });
   }
 
+  async fetchAndSplitQKVWeightTensors(url, dims, ops) {
+    const data = transpose(await fetchBin(url), dims[0], dims[1]);
+
+    const qWeights = transpose(data.subarray(0, dims[0] * dims[0]), dims[0], dims[0]);
+    const kWeights = transpose(data.subarray(dims[0] * dims[0], dims[0] * dims[0] * 2), dims[0], dims[0]);
+    const vWeights = transpose(data.subarray(dims[0] * dims[0] * 2, dims[0] * dims[0] * 3), dims[0], dims[0]);
+
+    const qWeightsBuffer = this.initTensor(qWeights, [dims[0], dims[0]], ops);
+    const kWeightsBuffer = this.initTensor(kWeights, [dims[0], dims[0]], ops);
+    const vWeightsBuffer = this.initTensor(vWeights, [dims[0], dims[0]], ops);
+
+    return [qWeightsBuffer, kWeightsBuffer, vWeightsBuffer];
+  }
+
+  async fetchAndSplitQKVBiasTensors(url, dims, ops) {
+    const data = await fetchBin(url);
+
+    const qBias = data.subarray(0, dims[0]);
+    const kBias = data.subarray(dims[0], dims[0] * 2);
+    const vBias = data.subarray(dims[0] * 2, dims[0] * 3);
+
+    const qBiasBuffer = this.initTensor(qBias, [dims[0]], ops);
+    const kBiasBuffer = this.initTensor(kBias, [dims[0]], ops);
+    const vBiasBuffer = this.initTensor(vBias, [dims[0]], ops);
+
+    return [qBiasBuffer, kBiasBuffer, vBiasBuffer];
+  }
+
+  async fetchAndInitTensor(url, dims, ops, constructor) {
+    console.log("Fetching and initializing tensor...", url);
+    const data = await fetchBin(url);
+    return this.initTensor(data, dims, ops, constructor ?? Float32Array);
+  }
+
   initOutputBuffer(commandEncoder, buffer, row, col) {
     const outputBuffer = this.initBuffer(["map_read", "copy_to"], row, col);
     commandEncoder.copyBufferToBuffer(buffer, 0, outputBuffer, 0, this.bufferSize(row, col));
@@ -403,13 +437,13 @@ class TestGPT {
     return buffer;
   }
 
-  initTensor(data, dims, ops) {
+  initTensor(data, dims, ops, constructor = Float32Array) {
     const buffer = this.device.createBuffer({
       size: this.bufferSize(dims[0], dims[1], dims[2] || 1),
       usage: ops.map((u) => bufferUsageDict[u]).reduce((a, b) => a | b),
       mappedAtCreation: true,
     });
-    const array = new Float32Array(buffer.getMappedRange());
+    const array = new constructor(buffer.getMappedRange());
     array.set(data);
     buffer.unmap();
     this.unloadDeletionStack.push(buffer);
@@ -457,6 +491,93 @@ class TestGPT {
         },
       });
     };
+  }
+
+  async testAttn() {
+    initializeOperations(this.device);
+    const [
+      qkvWeightArray,
+      qkvBiasArray,
+      linearWeightsBuffer,
+      linearBiasBuffer,
+      inputBuffer,
+      dOutputBuffer,
+    ] = await Promise.all([
+      this.fetchAndSplitQKVWeightTensors(`weights/test/c_attn_w.bin`, [1536, 3 * 1536], ["storage", "copy_from"]),
+      this.fetchAndSplitQKVBiasTensors(`weights/test/c_attn_b.bin`, [1536], ["storage"]),
+      this.fetchAndInitTensor(`weights/test/c_proj_w.bin`, [1536, 1536], ["storage"]),
+      this.fetchAndInitTensor(`weights/test/c_proj_b.bin`, [1536], ["storage"]),
+      this.fetchAndInitTensor(`weights/test/inp.bin`, [160, 1536], ["storage"]),
+      this.fetchAndInitTensor(`weights/test/grad_res.bin`, [160, 1536], ["storage"]),
+    ]);
+    const { resultBuffer, passes, caches } = AttentionBlock.newFusedInstance(
+      160,
+      1536,
+      0.0883883476,
+      12,
+      128,
+      inputBuffer,
+      qkvWeightArray[0],
+      qkvBiasArray[0],
+      qkvWeightArray[1],
+      qkvBiasArray[1],
+      qkvWeightArray[2],
+      qkvBiasArray[2],
+      linearWeightsBuffer,
+      linearBiasBuffer,
+      FastMatMulBlock,
+      SoftmaxBlock,
+    );
+    await runComputePasses(this.device, passes);
+    console.log(formatAsMatrix(
+      (await serializeBuffer(this.device, resultBuffer)).float32ArrayBuffer,
+      160, 1536
+    ));
+    const {
+      dInputBuffer,
+      dQWeightsBuffer,
+      dKWeightsBuffer,
+      dVWeightsBuffer,
+      dAttentionSoftmaxOutputsBufferMasked,
+      dAttentionSoftmaxOutputsBuffer,
+      passes: passes2
+    } = AttentionBackwards.newInstance(
+      dOutputBuffer,
+      caches,
+      160,
+      1536,
+      0.0883883476,
+      12,
+      128,
+      inputBuffer,
+      qkvWeightArray[0],
+      qkvBiasArray[0],
+      qkvWeightArray[1],
+      qkvBiasArray[1],
+      qkvWeightArray[2],
+      qkvBiasArray[2],
+      linearWeightsBuffer,
+      linearBiasBuffer,
+      FastMatMulBlock,
+      SoftmaxBlock,
+    )
+    await runComputePasses(this.device, passes2);
+    console.log(formatAsMatrix(
+      (await serializeBuffer(this.device, dAttentionSoftmaxOutputsBufferMasked)).float32ArrayBuffer,
+      12 * 160, 160
+    ));
+    console.log(formatAsMatrix(
+      (await serializeBuffer(this.device, dAttentionSoftmaxOutputsBuffer)).float32ArrayBuffer,
+      12 * 160, 160
+    ));
+    console.log("dInput", formatAsMatrix(
+      (await serializeBuffer(this.device, dInputBuffer)).float32ArrayBuffer,
+      160, 1536
+    ));
+    console.log("dKWeights", formatAsMatrix(
+      (await serializeBuffer(this.device, dQWeightsBuffer)).float32ArrayBuffer,
+      1536, 1536
+    ));
   }
 
   async testSoftmax() {
@@ -535,12 +656,100 @@ class TestGPT {
     ));
     console.log((await serializeBuffer(this.device, dBiasBuffer)));
   }
+
+  async testLoss() {
+    initializeOperations(this.device);
+    const [
+      aBuffer,
+      bBuffer
+    ] = await Promise.all([
+      this.fetchAndInitTensor(`weights/test/a.bin`, [640, 7680], ["storage", "copy_from"]),
+      this.fetchAndInitTensor(`weights/test/b.bin`, [640], ["storage"], Uint32Array),
+    ]);
+
+    const { resultBuffer, caches, passes } = CrossEntropyLoss.newInstance(
+      640,
+      7680,
+      aBuffer,
+      bBuffer,
+    );
+    await runComputePasses(this.device, passes);
+    console.log((await serializeBuffer(this.device, resultBuffer)).float32ArrayBuffer);
+
+    const dLosses = new Float32Array(new Array(640).fill(1/640));
+    const dLossesBuffer = this.initBuffer(['storage', 'copy_from', 'copy_to'], 640);
+    this.device.queue.writeBuffer(dLossesBuffer, 0, dLosses);
+    
+    const { dLogitsBuffer, passes: passes2 } = CrossEntropyBackwards.newInstance(
+      dLossesBuffer,
+      caches,
+      640,
+      7680,
+      aBuffer,
+      bBuffer,
+    );
+    await runComputePasses(this.device, passes2);
+    console.log(formatAsMatrix(
+      (await serializeBuffer(this.device, caches.probsBuffer)).float32ArrayBuffer,
+      640,
+      7680,
+    ));
+    console.log(formatAsMatrix(
+      (await serializeBuffer(this.device, dLogitsBuffer)).float32ArrayBuffer,
+      640,
+      7680,
+    ));
+  }
+
+  async testLayerNorm() {
+    initializeOperations(this.device);
+    const [
+      aBuffer,
+      bBuffer
+    ] = await Promise.all([
+      this.fetchAndInitTensor(`weights/test/a.bin`, [640, 7680], ["storage", "copy_from"]),
+      this.fetchAndInitTensor(`weights/test/b.bin`, [640], ["storage"], Uint32Array),
+    ]);
+
+    const { resultBuffer, caches, passes } = CrossEntropyLoss.newInstance(
+      640,
+      7680,
+      aBuffer,
+      bBuffer,
+    );
+    await runComputePasses(this.device, passes);
+    console.log((await serializeBuffer(this.device, resultBuffer)).float32ArrayBuffer);
+
+    const dLosses = new Float32Array(new Array(640).fill(1/640));
+    const dLossesBuffer = this.initBuffer(['storage', 'copy_from', 'copy_to'], 640);
+    this.device.queue.writeBuffer(dLossesBuffer, 0, dLosses);
+    
+    const { dLogitsBuffer, passes: passes2 } = CrossEntropyBackwards.newInstance(
+      dLossesBuffer,
+      caches,
+      640,
+      7680,
+      aBuffer,
+      bBuffer,
+    );
+    await runComputePasses(this.device, passes2);
+    console.log(formatAsMatrix(
+      (await serializeBuffer(this.device, caches.probsBuffer)).float32ArrayBuffer,
+      640,
+      7680,
+    ));
+    console.log(formatAsMatrix(
+      (await serializeBuffer(this.device, dLogitsBuffer)).float32ArrayBuffer,
+      640,
+      7680,
+    ));
+  }
 }
 
 async function test() {
   const GPU = new TestGPT();
   await GPU.initialize();
-  await GPU.testSoftmax();
+  await GPU.testAttn();
 }
 
 /*
