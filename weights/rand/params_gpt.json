@@ -1,0 +1,9 @@
+{
+  "n_layer": 2,
+  "n_head": 4,
+  "n_embd": 128,
+  "n_ctx": 64,
+  "bias": true,
+  "vocab_size": 65,
+  "dropout": 0.0
+}

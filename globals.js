@@ -5,9 +5,12 @@ const AttentionBlock = new AttentionBlockClass();
 const AttentionBackwards = new AttentionBackwardsClass();
 const ResidualBlock = new ResidualBlockClass();
 const EmbedBlock = new EmbedBlockClass();
+const EmbedBackwards = new EmbedBackwardsClass();
 const DeEmbedBlock = new DeEmbedBlockClass();
 const GeluBlock = new GeluBlockClass();
+const GeluBackwards = new GeluBackwardsClass();
 const LayerNormBlock = new LayerNormBlockClass();
+const LayerNormBackwards = new LayerNormBackwardsClass();
 const SoftmaxBlock = new SoftmaxBlockClass();
 const SoftmaxBackwards = new SoftmaxBackwardsClass();
 const TransposeBlock = new TransposeBlockClass();
@@ -16,7 +19,7 @@ const CrossEntropyBackwards = new CrossEntropyBackwardsClass();
 
 // Needed for deletion.
 let operations = [FastMatMulBlock, FastMatMulBatchedBlock, FastMatMulBackwards, AttentionBlock, AttentionBackwards,
-  ResidualBlock, EmbedBlock, DeEmbedBlock, GeluBlock, LayerNormBlock, SoftmaxBlock, SoftmaxBackwards, TransposeBlock,
+  ResidualBlock, EmbedBlock, EmbedBackwards, DeEmbedBlock, GeluBlock, GeluBackwards, LayerNormBlock, LayerNormBackwards, SoftmaxBlock, SoftmaxBackwards, TransposeBlock,
   CrossEntropyLoss, CrossEntropyBackwards];
 
 function initializeOperations(device) {
@@ -79,6 +82,7 @@ function selectTopK(probs, top_k) {
     .map(({ index }) => index);
   const topKIndices = sortedIndices.slice(0, top_k);
   const topKProbs = topKIndices.map((index) => probs[index]);
+  console.log(topKProbs)
   return { topKIndices, topKProbs };
 }
 

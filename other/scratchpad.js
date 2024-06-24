@@ -703,45 +703,99 @@ class TestGPT {
 
   async testLayerNorm() {
     initializeOperations(this.device);
-    const [
-      aBuffer,
-      bBuffer
-    ] = await Promise.all([
-      this.fetchAndInitTensor(`weights/test/a.bin`, [640, 7680], ["storage", "copy_from"]),
-      this.fetchAndInitTensor(`weights/test/b.bin`, [640], ["storage"], Uint32Array),
+    const [ inputBuffer, dOutputBuffer ] = await Promise.all([
+      this.fetchAndInitTensor(`weights/test/ln_in.bin`, [4, 8], ["storage", "copy_from"]),
+      this.fetchAndInitTensor(`weights/test/ln_grads.bin`, [4, 8], ["storage", "copy_from"]),
     ]);
 
-    const { resultBuffer, caches, passes } = CrossEntropyLoss.newInstance(
-      640,
-      7680,
-      aBuffer,
-      bBuffer,
-    );
-    await runComputePasses(this.device, passes);
-    console.log((await serializeBuffer(this.device, resultBuffer)).float32ArrayBuffer);
+    const gammaArray = new Float32Array(new Array(8).fill(1));
+    const gammaBuffer = this.initBuffer(['storage', 'copy_from', 'copy_to'], 8);
+    this.device.queue.writeBuffer(gammaBuffer, 0, gammaArray);
 
-    const dLosses = new Float32Array(new Array(640).fill(1/640));
-    const dLossesBuffer = this.initBuffer(['storage', 'copy_from', 'copy_to'], 640);
-    this.device.queue.writeBuffer(dLossesBuffer, 0, dLosses);
-    
-    const { dLogitsBuffer, passes: passes2 } = CrossEntropyBackwards.newInstance(
-      dLossesBuffer,
-      caches,
-      640,
-      7680,
-      aBuffer,
-      bBuffer,
+    const betaArray = new Float32Array(new Array(8).fill(0));
+    const betaBuffer = this.initBuffer(['storage', 'copy_from', 'copy_to'], 8);
+    this.device.queue.writeBuffer(betaBuffer, 0, betaArray);
+
+    const { resultBuffer, caches, passes } = LayerNormBlock.newInstance(
+      4, 8,
+      inputBuffer,
+      gammaBuffer,
+      betaBuffer,
+    )
+    await runComputePasses(this.device, passes);
+    console.log(formatAsMatrix(
+      (await serializeBuffer(this.device, resultBuffer)).float32ArrayBuffer,
+      4,
+      8,
+    ));
+
+    // backprop
+    const {
+      dInputBuffer,
+      dBetaBuffer,
+      dGammaBuffer,
+      passes: passes2,
+    } = LayerNormBackwards.newInstance(
+      dOutputBuffer, caches,
+      4, 8,
+      inputBuffer, gammaBuffer, betaBuffer
     );
     await runComputePasses(this.device, passes2);
     console.log(formatAsMatrix(
-      (await serializeBuffer(this.device, caches.probsBuffer)).float32ArrayBuffer,
-      640,
-      7680,
+      (await serializeBuffer(this.device, dInputBuffer)).float32ArrayBuffer,
+      4,
+      8,
     ));
     console.log(formatAsMatrix(
-      (await serializeBuffer(this.device, dLogitsBuffer)).float32ArrayBuffer,
-      640,
-      7680,
+      (await serializeBuffer(this.device, dGammaBuffer)).float32ArrayBuffer,
+      4,
+      8,
+    ));
+    console.log(formatAsMatrix(
+      (await serializeBuffer(this.device, dBetaBuffer)).float32ArrayBuffer,
+      4,
+      8,
+    ));
+  }
+
+  async testMisc() {
+    initializeOperations(this.device);
+
+    const [
+      inputBuffer,
+      dOutputBuffer
+    ] = await Promise.all([
+      this.fetchAndInitTensor(`weights/test/gelu_in.bin`, [8, 16], ["storage", "copy_from"]),
+      this.fetchAndInitTensor(`weights/test/gelu_grads.bin`, [8, 16], ["storage", "copy_from"]),
+    ]);
+    const {
+      resultBuffer,
+      passes,
+    } = GeluBlock.newInstance(
+      8, 16,
+      inputBuffer
+    );
+    await runComputePasses(this.device, passes);
+    console.log(formatAsMatrix(
+      (await serializeBuffer(this.device, resultBuffer)).float32ArrayBuffer,
+      8,
+      16,
+    ));
+
+    // back
+    const {
+      dInputBuffer,
+      passes: passes2,
+    } = GeluBackwards.newInstance(
+      dOutputBuffer,
+      8, 16,
+      inputBuffer,
+    );
+    await runComputePasses(this.device, passes2);
+    console.log(formatAsMatrix(
+      (await serializeBuffer(this.device, dInputBuffer)).float32ArrayBuffer,
+      8,
+      16,
     ));
   }
 }
@@ -749,7 +803,7 @@ class TestGPT {
 async function test() {
   const GPU = new TestGPT();
   await GPU.initialize();
-  await GPU.testAttn();
+  await GPU.testMisc();
 }
 
 /*

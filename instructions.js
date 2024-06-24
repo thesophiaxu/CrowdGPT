@@ -91,11 +91,13 @@ class Block {
         })),
       });
 
+    this.r_r_r_r_r_Layout = bg(["read-only-storage", "read-only-storage", "read-only-storage", "read-only-storage", "read-only-storage"]);
     this.r_r_r_r_Layout = bg(["read-only-storage", "read-only-storage", "read-only-storage", "read-only-storage"]);
     this.r_r_r_Layout = bg(["read-only-storage", "read-only-storage", "read-only-storage"]);
     this.r_r_Layout = bg(["read-only-storage", "read-only-storage"]);
     this.r_Layout = bg(["read-only-storage"]);
     this.u_s_Layout = bg(["uniform", "storage"]);
+    this.u_s_s_Layout = bg(["uniform", "storage", "storage"]);
     this.u_s_s_s_Layout = bg(["uniform", "storage", "storage", "storage"]);
   }
 
@@ -764,6 +766,7 @@ class LayerNormBlockClass extends Block {
 
     return {
       resultBuffer: normResultBuffer,
+      caches: { statsResultBuffer },
       passes: [
         {
           flag: "compute",
@@ -882,6 +885,163 @@ class LayerNormBlockClass extends Block {
       result_array[row * ND4 + col] = shift;
     }
   `;
+}
+
+class LayerNormBackwardsClass extends Block {
+  constructor() {
+    super();
+    this.name = "layernorm_back"
+  }
+
+  getPipeline() {
+    const pipelineCacheKey = `${this.name}`; // No param optimization.
+    if (this.pipelineCache.has(pipelineCacheKey)) return this.pipelineCache.get(pipelineCacheKey);
+    const pipeline = this.initPipeline(this.superNaiveShader, [this.u_s_s_s_Layout, this.r_r_r_r_r_Layout], `${this.name}_Pipeline_`);
+    this.pipelineCache.set(pipelineCacheKey, pipeline);
+    return pipeline;
+  }
+
+  getRPipeline() {
+    const pipelineCacheKey = `${this.name}R`; // No param optimization.
+    if (this.pipelineCache.has(pipelineCacheKey)) return this.pipelineCache.get(pipelineCacheKey);
+    const pipeline = this.initPipeline(this.reduceShader, [this.u_s_s_Layout, this.r_r_Layout], `${this.name}_Pipeline_R`);
+    this.pipelineCache.set(pipelineCacheKey, pipeline);
+    return pipeline;
+  }
+
+  newInstance(
+    dOutputBuffer, caches,
+    rows, cols,
+    inputBuffer, gammaBuffer, betaBuffer,
+  ) {
+    const pipeline = this.getPipeline();
+    const uniformBuffer = this.initUniform(4, [[0, new Uint32Array([rows, cols])]]);
+    const dInputBuffer = this.initResultBuffer([rows, cols]);
+    const dGammaBuffer_ = this.initResultBuffer([rows, cols]);
+    const dBetaBuffer_ = this.initResultBuffer([rows, cols]);
+    const outputBindGroup = this.initBindGroup(this.u_s_s_s_Layout, [uniformBuffer, dInputBuffer, dGammaBuffer_, dBetaBuffer_], `${this.name}_BindGroup_norm`);
+    const inputBindGroup = this.initBindGroup(
+      this.r_r_r_r_r_Layout,
+      [dOutputBuffer, caches.statsResultBuffer, inputBuffer, gammaBuffer, betaBuffer],
+      `${this.name}_InputBindGroup_norm`
+    );
+    const workgroups = { x: wgSize(rows, 8), y: 1, z: 1 };
+
+    const pipelineR = this.getRPipeline();
+    const dGammaBuffer = this.initResultBuffer([cols]);
+    const dBetaBuffer = this.initResultBuffer([cols]);
+    const outputRBindGroup = this.initBindGroup(this.u_s_s_Layout, [uniformBuffer, dGammaBuffer, dBetaBuffer], `${this.name}_BindGroup_norm`);
+    const inputRBindGroup = this.initBindGroup(
+      this.r_r_Layout,
+      [dGammaBuffer_, dBetaBuffer_],
+      `${this.name}_InputBindGroup_red`
+    );
+    const workgroups2 = { x: 1, y: wgSize(cols, 8), z: 1 };
+
+    return {
+      dInputBuffer,
+      dGammaBuffer,
+      dBetaBuffer,
+      passes: [
+        {
+          flag: "compute",
+          pipeline: pipeline,
+          groups: [outputBindGroup, inputBindGroup],
+          workgroups,
+        },
+        {
+          flag: "compute",
+          pipeline: pipelineR,
+          groups: [outputRBindGroup, inputRBindGroup],
+          workgroups: workgroups2,
+        },
+      ]
+    }
+  }
+
+  reduceShader = `
+    struct Meta {
+      M: u32,
+      N: u32,
+    }
+
+    @group(0) @binding(0) var<uniform> uniforms: Meta;
+    @group(0) @binding(1) var<storage, read_write> output_array1: array<f32>;
+    @group(0) @binding(2) var<storage, read_write> output_array2: array<f32>;
+
+    @group(1) @binding(0) var<storage, read> input_array1: array<f32>;
+    @group(1) @binding(1) var<storage, read> input_array2: array<f32>;
+
+    @compute @workgroup_size(1, 8)
+    fn main (@builtin(global_invocation_id) global_id: vec3<u32>) {
+      var col: u32 = global_id.y;
+      let M: u32 = uniforms.M;
+      let N: u32 = uniforms.N;
+
+      if (col >= N) {
+        return;
+      }
+
+      for (var i: u32 = 0; i < M; i += 1) {
+        output_array1[col] += input_array1[i * N + col];
+        output_array2[col] += input_array2[i * N + col];
+      }
+    }
+  `
+
+  superNaiveShader = `
+    struct Meta {
+      M: u32,
+      N: u32,
+    }
+
+    @group(0) @binding(0) var<uniform> uniforms: Meta;
+    @group(0) @binding(1) var<storage, read_write> dInput_array: array<f32>;
+    @group(0) @binding(2) var<storage, read_write> dGamma_array: array<f32>;
+    @group(0) @binding(3) var<storage, read_write> dBeta_array: array<f32>;
+
+    @group(1) @binding(0) var<storage, read> dOutput_array: array<f32>;
+    @group(1) @binding(1) var<storage, read> stats_array: array<f32>;
+    @group(1) @binding(2) var<storage, read> input_array: array<f32>;
+    @group(1) @binding(3) var<storage, read> gamma_array: array<f32>;
+    @group(1) @binding(4) var<storage, read> beta_array: array<f32>;
+
+    @compute @workgroup_size(8)
+    fn main (@builtin(global_invocation_id) global_id: vec3<u32>) {
+      var row: u32 = global_id.x;
+      let M: u32 = uniforms.M;
+      let N: u32 = uniforms.N;
+
+      if (row >= M) {
+        return;
+      }
+
+      var dnorm_mean: f32 = 0.0;
+      var dnorm_norm_mean: f32 = 0.0;
+      for (var i: u32 = 0; i < N; i += 1) {
+        let norm_bi: f32 = (input_array[row * N + i] - stats_array[row * 2]) / stats_array[row * 2 + 1];
+        let dnorm_i: f32 = gamma_array[i] * dOutput_array[row * M + i];
+        dnorm_mean += dnorm_i;
+        dnorm_norm_mean += dnorm_i * norm_bi;
+      }
+      dnorm_mean = dnorm_mean / f32(N);
+      dnorm_norm_mean = dnorm_norm_mean / f32(N);
+
+      for (var i: u32 = 0; i < N; i += 1) {
+        let norm_bi: f32 = (input_array[row * N + i] - stats_array[row * 2]) / stats_array[row * 2 + 1];
+        let dnorm_i: f32 = gamma_array[i] * dOutput_array[row * N + i];
+        dBeta_array[row * N + i] += dOutput_array[row * N + i];
+        dGamma_array[row * N + i] += norm_bi * dOutput_array[row * N + i];
+        var dval: f32 = 0.0;
+        dval += dnorm_i;
+        dval -= dnorm_mean;
+        dval -= norm_bi * dnorm_norm_mean;
+        dval /= stats_array[row * 2 + 1];
+        dInput_array[row * N + i] = dval;
+      }
+    }
+
+  `
 }
 
 class SoftmaxBlockClass extends Block {
@@ -1153,6 +1313,88 @@ class GeluBlockClass extends Block {
   `;
 }
 
+class GeluBackwardsClass extends Block {
+  constructor() {
+    super();
+    this.name = "gelu_back";
+  }
+
+  getPipeline() {
+    const pipelineCacheKey = this.name; // No param optimization.
+    if (this.pipelineCache.has(pipelineCacheKey)) return this.pipelineCache.get(pipelineCacheKey);
+    const pipeline = this.initPipeline(this.GELUBackShader, [this.u_s_Layout, this.r_r_Layout], `${this.name}_Pipeline`);
+    this.pipelineCache.set(pipelineCacheKey, pipeline);
+    return pipeline;
+  }
+
+  newInstance(dOutputBuffer, rows, cols, inputBuf) {
+    if (cols % 4 !== 0) throw new Error("Cols must be divisible by 4.");
+    const pipeline = this.getPipeline();
+    const uniformBuffer = this.initUniform(4, [[0, new Uint32Array([rows, Math.ceil(cols / 4)])]]);
+    const dInputBuffer = this.initResultBuffer([rows, cols]);
+    const opBindGroup = this.initBindGroup(this.u_s_Layout, [uniformBuffer, dInputBuffer], `${this.name}_OpG`);
+    const inputBindGroup = this.initBindGroup(this.r_r_Layout, [dOutputBuffer, inputBuf], `${this.name}_InputG`);
+    const workgroups = { x: wgSize(cols, 32), y: wgSize(rows, 8), z: 1 };
+
+    return {
+      dInputBuffer,
+      passes: [
+        {
+          flag: "compute",
+          pipeline,
+          groups: [opBindGroup, inputBindGroup],
+          workgroups,
+        },
+      ],
+    };
+  }
+
+  GELUBackShader = `
+    struct Meta {
+      M: u32,
+      ND4: u32,
+    }
+
+    const LOW_THRESHOLD: vec4<f32> = vec4<f32>(-10.0);
+    const HIGH_THRESHOLD: vec4<f32> = vec4<f32>(10.0);
+    const ZERO: vec4<f32> = vec4<f32>(0.0);
+    const HALF: vec4<f32> = vec4<f32>(0.5);
+    const SQRPI: vec4<f32> = vec4<f32>(0.7978845608);
+    const COEFF: vec4<f32> = vec4<f32>(0.044715);
+    
+    fn gelu_back_vec4(x: vec4<f32>, dout: vec4<f32>) -> vec4<f32> {
+      let x_cubed: vec4<f32> = COEFF * pow(x, vec4<f32>(3.0));
+      let tanh_arg: vec4<f32> = SQRPI * (x + x_cubed);
+      let tanh_out: vec4<f32> = tanh(tanh_arg);
+      let cosh_out: vec4<f32> = cosh(tanh_arg);
+      let sech_out: vec4<f32> = vec4<f32>(1.0) / (cosh_out * cosh_out);
+      let local_grad: vec4<f32> = HALF * (vec4<f32>(1.0) + tanh_out)
+        + x * HALF * sech_out * SQRPI * (vec4<f32>(1.0) + vec4<f32>(3.0) * COEFF * x * x);
+      return local_grad * dout;
+    }
+
+    @group(1) @binding(0) var<storage,read> dOutput_array: array<vec4<f32>>;
+    @group(1) @binding(1) var<storage,read> input_array: array<vec4<f32>>;
+
+    @group(0) @binding(0) var<uniform> uniforms: Meta;
+    @group(0) @binding(1) var<storage,read_write> dInput_array: array<vec4<f32>>;
+
+    @compute @workgroup_size(8, 8)
+    fn main (@builtin(global_invocation_id) global_id: vec3<u32>) {
+      var col: u32 = global_id.x;
+      var row: u32 = global_id.y;
+      var ND4: u32 = uniforms.ND4;
+      var M: u32 = uniforms.M;
+      
+      if (row >= M || col >= ND4) {
+        return;
+      }
+
+      dInput_array[row * ND4 + col] = gelu_back_vec4(input_array[row * ND4 + col], dOutput_array[row * ND4 + col]);
+    }
+  `;
+}
+
 class EmbedBlockClass extends Block {
   constructor() {
     super();
@@ -1229,6 +1471,53 @@ class EmbedBlockClass extends Block {
       resultBuffer: residualResult,
       passes: [...embdCopyCommands, posCopyCommand, ...residualPasses],
     };
+  }
+}
+
+class EmbedBackwardsClass extends Block {
+  constructor() {
+    super();
+    this.name = "embed_back";
+  }
+
+  newInstance(dOutputBuffer, idx, seq_length, n_embd, vocab_size, block_size, embdBuffers, posEmbdBuffer) {
+    const dWteBuffer = this.initBuffer(["storage", "copy_to"], [vocab_size, n_embd]);
+    const dWpeBuffer = this.initBuffer(["storage", "copy_to"], [block_size, n_embd]);
+
+    const embdGradsCopyCommands = Array(seq_length)
+      .fill()
+      .map((_, i) => {
+        return {
+          flag: "copy",
+          src: dOutputBuffer,
+          srcOffset: this.bufferSize(n_embd) * i,
+          dst: dWteBuffer,
+          dstOffset: this.bufferSize(n_embd) * idx[i],
+          size: this.bufferSize(n_embd),
+        };
+      })
+
+    const posGradsCopyCommands = Array(seq_length)
+      .fill()
+      .map((_, i) => {
+        return {
+          flag: "copy",
+          src: dOutputBuffer,
+          srcOffset: this.bufferSize(n_embd) * i,
+          dst: dWpeBuffer,
+          dstOffset: this.bufferSize(n_embd) * (i % block_size),
+          size: this.bufferSize(n_embd),
+        };
+      })
+
+    return {
+      dWteBuffer,
+      dWpeBuffer,
+      passes: [
+        ...embdGradsCopyCommands,
+        ...posGradsCopyCommands,
+      ]
+    }
   }
 }
 

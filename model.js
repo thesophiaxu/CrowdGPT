@@ -487,6 +487,8 @@ class GPT {
       return { vocab_chunk_size: vocab_chunk_size / n_embd, splits };
     }
     const { vocab_chunk_size, splits } = vocabChunkSizeCalc(params.vocab_size, params.n_embd, minSplits, this.device.limits.maxStorageBufferBindingSize);
+    console.log("Splits: ", splits)
+    if (splits !== 1) console.error("This model will be too big to train here.")
     if (splits > minSplits) console.warn(`Non-optimal number of vocab splits. Optimal: ${minSplits}, Selected: ${splits}`);
 
     // Set derived parameters
