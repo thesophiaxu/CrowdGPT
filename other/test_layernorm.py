@@ -4,8 +4,8 @@ import torch.nn as nn
 torch.manual_seed(42)
 
 # Sample toy data with small sizes
-batch_size = 4
-num_features = 8
+batch_size = 16
+num_features = 128
 
 # Generate random input tensor
 input_tensor = torch.randn(batch_size, num_features, requires_grad=True)
@@ -29,6 +29,7 @@ print("\nLoss Tensor:")
 print(loss)
 print("\nGradients w.r.t. Input Tensor:")
 print(input_tensor.grad)
+print(input_tensor.grad.size())
 print(layer_norm.weight.grad)
 print(layer_norm.bias.grad)
 

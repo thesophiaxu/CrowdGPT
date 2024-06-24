@@ -120,6 +120,12 @@ class GPT {
     this.initialized = true;
 
     console.log("Model initialized");
+
+    this.model.layer_caches = [];
+    for (let i=0; i<this.params.n_layer; ++i) {
+      this.model.layer_caches.push({});
+    }
+    this.training = false;
   }
 
   async *generate(prompt, max_new_tokens, top_k, temperature) {
@@ -205,10 +211,10 @@ class GPT {
           layer: i,
           seq_length,
           intermediateBuffer,
-          residualBuffer,
+          intermediateBuffer,
         })
         intermediateBuffer = resultBuffers.intermediateBuffer;
-        residualBuffer = resultBuffers.residualBuffer;
+        residualBuffer = resultBuffers.intermediateBuffer;
       }
       await runComputePasses(this.device, this.computePasses);
       this.computePasses = [];
@@ -219,10 +225,10 @@ class GPT {
         to: n_layer,
         seq_length,
         intermediateBuffer,
-        residualBuffer,
+        intermediateBuffer,
       });
       intermediateBuffer = remoteResults.intermediateBuffer;
-      residualBuffer = remoteResults.residualBuffer;
+      residualBuffer = remoteResults.intermediateBuffer;
     } else {
       for (let i = 0; i < n_layer; i++) {
         const resultBuffers = await this.runLayer({
@@ -232,7 +238,7 @@ class GPT {
           residualBuffer,
         })
         intermediateBuffer = resultBuffers.intermediateBuffer;
-        residualBuffer = resultBuffers.residualBuffer;
+        residualBuffer = resultBuffers.intermediateBuffer;
       }
     }
 
@@ -328,26 +334,31 @@ class GPT {
   }
 
   async runLayer({
-    layer, seq_length, intermediateBuffer, residualBuffer
+    layer, seq_length, intermediateBuffer
   }) {
-    const { layer_buffers } = this.model;
+    const { layer_buffers, layer_caches } = this.model;
     const { attention_scale, n_embd, n_head, head_size, hidden_size } = this.params;
     const i = layer;
     const buffers = layer_buffers[i];
+    const caches = layer_caches[i];
+    let residualBuffer = intermediateBuffer;
     // console.log('Data transfer overhead: ', Date.now() - t0, ' ms');
     {
-      const { passes, resultBuffer } = LayerNormBlock.newInstance(
+      const { passes, caches: lnCaches, resultBuffer } = LayerNormBlock.newInstance(
         seq_length,
         n_embd,
         intermediateBuffer,
         buffers.normAttentionGammaBuffer,
         buffers.normAttentionBetaBuffer
       );
+      if (this.training) {
+        caches.layerNorm1StatsResultBuffer = lnCaches.statsResultBuffer;
+      }
       intermediateBuffer = resultBuffer;
       this.computePasses.push(...passes);
     }
     {
-      const { passes, tmpBuffer, resultBuffer } = AttentionBlock.newFusedInstance(
+      const { passes, tmpBuffer, caches: attnCaches, resultBuffer } = AttentionBlock.newFusedInstance(
         seq_length,
         n_embd,
         attention_scale,
@@ -365,6 +376,10 @@ class GPT {
         FastMatMulBlock,
         SoftmaxBlock
       );
+      if (this.training) {
+        caches.attentionCaches = attnCaches;
+        caches.attentionInputBuffer = intermediateBuffer;
+      }
       intermediateBuffer = resultBuffer;
       this.computePasses.push(...passes);
 
@@ -384,13 +399,17 @@ class GPT {
       this.computePasses.push(...passes);
     }
     {
-      const { passes, resultBuffer } = LayerNormBlock.newInstance(
+      const { passes, caches: lnCaches, resultBuffer } = LayerNormBlock.newInstance(
         seq_length,
         n_embd,
         intermediateBuffer,
         buffers.normLinearGammaBuffer,
         buffers.normLinearBetaBuffer
       );
+      if (this.training) {
+        caches.layerNorm2StatsResultBuffer = lnCaches.statsResultBuffer;
+        caches.layerNorm2InputBuffer = intermediateBuffer;
+      }
       intermediateBuffer = resultBuffer;
       this.computePasses.push(...passes);
     }
@@ -403,8 +422,13 @@ class GPT {
         buffers.firstLayerWeightsBuffer,
         buffers.firstLayerBiasBuffer
       );
+      if (this.training) {
+        caches.mlp1OutputBuffer = resultBuffer;
+        caches.mlp1InputBuffer = intermediateBuffer;
+      }
       intermediateBuffer = resultBuffer;
       this.computePasses.push(...passes);
+      
     }
     {
       const { resultBuffer, passes } = GeluBlock.newInstance(seq_length, hidden_size, intermediateBuffer);
@@ -420,6 +444,7 @@ class GPT {
         buffers.secondLayerWeightsBuffer,
         buffers.secondLayerBiasBuffer
       );
+      if (this.training) caches.mlp2InputBuffer = intermediateBuffer;
       intermediateBuffer = resultBuffer;
       this.computePasses.push(...passes);
     }
@@ -440,7 +465,249 @@ class GPT {
     //   //console.log(sb);
     //   console.log('Data serialize overhead: ', Date.now() - t0, ' ms');
     // }
-    return { intermediateBuffer, residualBuffer };
+    return { intermediateBuffer };
+  }
+
+  async layerBackwards({
+    layer,
+    dOutputBuffer,
+    seq_length,
+    inputBuffer,
+  }) {
+    const { layer_buffers, layer_caches } = this.model;
+    const { attention_scale, n_embd, n_head, head_size, hidden_size } = this.params;
+
+    const buffers = layer_buffers[layer];
+    const cache = layer_caches[layer];
+
+    const {
+      mlp2InputBuffer,
+      mlp1OutputBuffer,
+      mlp1InputBuffer,
+      layerNorm2StatsResultBuffer,
+      layerNorm2InputBuffer,
+      attentionInputBuffer,
+      attentionCaches,
+      layerNorm1StatsResultBuffer,
+    } = cache;
+
+    const dMlp2OutputBuffer = dOutputBuffer;
+    const dResidualOutputBuffer_1Component = dOutputBuffer;
+    const {
+      dInputBuffer: dMlp2InputBuffer,
+      dWeightsBuffer: dMlp2WeightBuffer,
+      dBiasBuffer: dMlp2BiasBuffer,
+      passes: dMlp2Passes
+    } = FastMatMulBackwards.newInstance(
+      dMlp2OutputBuffer,
+      seq_length,
+      n_embd,
+      hidden_size,
+      mlp2InputBuffer,
+      buffers.secondLayerWeightsBuffer,
+      buffers.secondLayerBiasBuffer,
+    )
+
+    const { 
+      dInputBuffer: dMlp1OutputBuffer,
+      passes: dGeluPasses,
+     } = GeluBackwards.newInstance(dMlp2InputBuffer, seq_length, hidden_size, mlp1OutputBuffer);
+
+     const {
+      dInputBuffer: dLn2OuptutBuffer,
+      dWeightsBuffer: dMlp1WeightBuffer,
+      dBiasBuffer: dMlp1BiasBuffer,
+      passes: dMlp1Passes
+    } = FastMatMulBackwards.newInstance(
+      dMlp1OutputBuffer,
+      seq_length,
+      hidden_size,
+      n_embd,
+      mlp1InputBuffer,
+      buffers.firstLayerWeightsBuffer,
+      buffers.firstLayerBiasBuffer,
+    );
+
+    const {
+      dInputBuffer: dResidualOutputBuffer_2Component,
+      dGammaBuffer: dLn2WeightBuffer,
+      dBetaBuffer: dLn2BiasBuffer,
+      passes: dLayerNorm2Passes
+    } = LayerNormBackwards.newInstance(
+      dLn2OuptutBuffer,
+      { statsResultBuffer: layerNorm2StatsResultBuffer },
+      seq_length,
+      n_embd,
+      layerNorm2InputBuffer,
+      buffers.normLinearGammaBuffer,
+      buffers.normLinearBetaBuffer
+    );
+
+    const {
+      resultBuffer: dResidualOutputBuffer,
+      passes: combinePasses1,
+    } = ResidualBlock.newInstance(
+      seq_length,
+      n_embd,
+      dResidualOutputBuffer_1Component,
+      dResidualOutputBuffer_2Component,
+    );
+
+    const dAttentionOutputBuffer = dResidualOutputBuffer;
+    const dInputBuffer_1Component = dResidualOutputBuffer;
+
+    const {
+      dInputBuffer: dAttentionInputBuffer,
+      dQWeightsBuffer: dAttentionQWeightBuffer,
+      dKWeightsBuffer: dAttentionKWeightBuffer,
+      dVWeightsBuffer: dAttentionVWeightBuffer,
+      dQBiasBuffer: dAttentionQBiasBuffer,
+      dKBiasBuffer: dAttentionKBiasBuffer,
+      dVBiasBuffer: dAttentionVBiasBuffer,
+      dLinearWeightsBuffer: dAttentionLinearWeightBuffer,
+      dLinearBiasBuffer: dAttentionLinearBiasBuffer,
+      passes: dAttentionPasses,
+    } = AttentionBackwards.newInstance(
+      dAttentionOutputBuffer,
+      attentionCaches,
+      seq_length,
+      n_embd,
+      attention_scale,
+      n_head,
+      head_size,
+      attentionInputBuffer,
+      buffers.qkvWeightArray[0],
+      buffers.qkvBiasArray[0],
+      buffers.qkvWeightArray[1],
+      buffers.qkvBiasArray[1],
+      buffers.qkvWeightArray[2],
+      buffers.qkvBiasArray[2],
+      buffers.linearWeightsBuffer,
+      buffers.linearBiasBuffer,
+      FastMatMulBlock,
+      SoftmaxBlock
+    )
+
+    const {
+      dInputBuffer: dInputBuffer_2Component,
+      dGammaBuffer: dLn1WeightBuffer,
+      dBetaBuffer: dLn1BiasBuffer,
+      passes: dLayerNorm1Passes,
+    } = LayerNormBackwards.newInstance(
+      dAttentionInputBuffer,
+      { statsResultBuffer: layerNorm1StatsResultBuffer },
+      seq_length,
+      n_embd,
+      inputBuffer,
+      buffers.normAttentionGammaBuffer,
+      buffers.normAttentionBetaBuffer
+    )
+
+    const {
+      resultBuffer: dInputBuffer,
+      passes: combinePasses2,
+    } = ResidualBlock.newInstance(
+      seq_length,
+      n_embd,
+      dInputBuffer_1Component,
+      dInputBuffer_2Component,
+    );
+    
+    return {
+      dInputBuffer,
+      dLn1WeightBuffer,
+      dLn1BiasBuffer,
+      dAttentionQWeightBuffer,
+      dAttentionQBiasBuffer,
+      dAttentionKWeightBuffer,
+      dAttentionKBiasBuffer,
+      dAttentionVWeightBuffer,
+      dAttentionVBiasBuffer,
+      dAttentionLinearWeightBuffer,
+      dAttentionLinearBiasBuffer,
+      dLn2WeightBuffer,
+      dLn2BiasBuffer,
+      dMlp1WeightBuffer,
+      dMlp1BiasBuffer,
+      dMlp2WeightBuffer,
+      dMlp2BiasBuffer,
+      passes: [
+        ...dMlp2Passes,
+        ...dGeluPasses,
+        ...dMlp1Passes,
+        ...dLayerNorm2Passes,
+        ...combinePasses1,
+        ...dAttentionPasses,
+        ...dLayerNorm1Passes,
+        ...combinePasses2,
+      ]
+    }
+  }
+
+  async testLayer() {
+    this.computePasses = [];
+    this.training = true;
+    const inputBuffer = await this.fetchAndInitTensor(`weights/test/1L_input.bin`, [16, 128], ["storage", "copy_from"]);
+    const dOutputBuffer = await this.fetchAndInitTensor(`weights/test/1L_dOutput.bin`, [16, 128], ["storage", "copy_from"]);
+    const emptyResidual = this.initTensor(new Array(16 * 128).fill(0), [16, 128], ["storage", "copy_from", "copy_to"])
+    const { intermediateBuffer } = await this.runLayer({
+      layer: 0, 
+      seq_length: 16,
+      residualBuffer: emptyResidual,
+      intermediateBuffer: inputBuffer,
+    });
+    await runComputePasses(this.device, this.computePasses);
+    console.log("OUTPUT:")
+    console.log(formatAsMatrix(
+      (await serializeBuffer(this.device, intermediateBuffer)).float32ArrayBuffer,
+      16,
+      128,
+    ));
+    console.log("DOUTPUT:")
+    console.log(formatAsMatrix(
+      (await serializeBuffer(this.device, dOutputBuffer)).float32ArrayBuffer,
+      16,
+      128,
+    ));
+    const {
+      dInputBuffer,
+      dLn1WeightBuffer,
+      dLn1BiasBuffer,
+      dAttentionQWeightBuffer,
+      dAttentionQBiasBuffer,
+      dAttentionKWeightBuffer,
+      dAttentionKBiasBuffer,
+      dAttentionVWeightBuffer,
+      dAttentionVBiasBuffer,
+      dAttentionLinearWeightBuffer,
+      dAttentionLinearBiasBuffer,
+      dLn2WeightBuffer,
+      dLn2BiasBuffer,
+      dMlp1WeightBuffer,
+      dMlp1BiasBuffer,
+      dMlp2WeightBuffer,
+      dMlp2BiasBuffer,
+      passes,
+    } = await this.layerBackwards({
+      layer: 0,
+      seq_length: 16,
+      dOutputBuffer,
+      inputBuffer,
+    })
+    await runComputePasses(this.device, passes);
+    console.log("dInput:")
+    console.log(formatAsMatrix(
+      (await serializeBuffer(this.device, dAttentionQWeightBuffer)).float32ArrayBuffer,
+      128,
+      128,
+    ));
+    console.log("dInput:")
+    console.log(formatAsMatrix(
+      (await serializeBuffer(this.device, dInputBuffer)).float32ArrayBuffer,
+      16, 128,
+      1,
+    ));
+    return;
   }
 
   async loadModel(folder) {

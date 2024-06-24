@@ -704,20 +704,20 @@ class TestGPT {
   async testLayerNorm() {
     initializeOperations(this.device);
     const [ inputBuffer, dOutputBuffer ] = await Promise.all([
-      this.fetchAndInitTensor(`weights/test/ln_in.bin`, [4, 8], ["storage", "copy_from"]),
-      this.fetchAndInitTensor(`weights/test/ln_grads.bin`, [4, 8], ["storage", "copy_from"]),
+      this.fetchAndInitTensor(`weights/test/ln_in.bin`, [16, 128], ["storage", "copy_from"]),
+      this.fetchAndInitTensor(`weights/test/ln_grads.bin`, [16, 128], ["storage", "copy_from"]),
     ]);
 
-    const gammaArray = new Float32Array(new Array(8).fill(1));
-    const gammaBuffer = this.initBuffer(['storage', 'copy_from', 'copy_to'], 8);
+    const gammaArray = new Float32Array(new Array(16).fill(1));
+    const gammaBuffer = this.initBuffer(['storage', 'copy_from', 'copy_to'], 16);
     this.device.queue.writeBuffer(gammaBuffer, 0, gammaArray);
 
-    const betaArray = new Float32Array(new Array(8).fill(0));
-    const betaBuffer = this.initBuffer(['storage', 'copy_from', 'copy_to'], 8);
+    const betaArray = new Float32Array(new Array(16).fill(0));
+    const betaBuffer = this.initBuffer(['storage', 'copy_from', 'copy_to'], 16);
     this.device.queue.writeBuffer(betaBuffer, 0, betaArray);
 
     const { resultBuffer, caches, passes } = LayerNormBlock.newInstance(
-      4, 8,
+      16, 128,
       inputBuffer,
       gammaBuffer,
       betaBuffer,
@@ -725,8 +725,8 @@ class TestGPT {
     await runComputePasses(this.device, passes);
     console.log(formatAsMatrix(
       (await serializeBuffer(this.device, resultBuffer)).float32ArrayBuffer,
-      4,
-      8,
+      16,
+      128,
     ));
 
     // backprop
@@ -737,66 +737,32 @@ class TestGPT {
       passes: passes2,
     } = LayerNormBackwards.newInstance(
       dOutputBuffer, caches,
-      4, 8,
+      16,
+      128,
       inputBuffer, gammaBuffer, betaBuffer
     );
     await runComputePasses(this.device, passes2);
     console.log(formatAsMatrix(
       (await serializeBuffer(this.device, dInputBuffer)).float32ArrayBuffer,
-      4,
-      8,
+      16,
+      128,
     ));
     console.log(formatAsMatrix(
       (await serializeBuffer(this.device, dGammaBuffer)).float32ArrayBuffer,
-      4,
-      8,
+      16,
+      128,
     ));
     console.log(formatAsMatrix(
       (await serializeBuffer(this.device, dBetaBuffer)).float32ArrayBuffer,
-      4,
-      8,
+      16,
+      128,
     ));
   }
 
   async testMisc() {
-    initializeOperations(this.device);
+    //initializeOperations(this.device);
 
-    const [
-      inputBuffer,
-      dOutputBuffer
-    ] = await Promise.all([
-      this.fetchAndInitTensor(`weights/test/gelu_in.bin`, [8, 16], ["storage", "copy_from"]),
-      this.fetchAndInitTensor(`weights/test/gelu_grads.bin`, [8, 16], ["storage", "copy_from"]),
-    ]);
-    const {
-      resultBuffer,
-      passes,
-    } = GeluBlock.newInstance(
-      8, 16,
-      inputBuffer
-    );
-    await runComputePasses(this.device, passes);
-    console.log(formatAsMatrix(
-      (await serializeBuffer(this.device, resultBuffer)).float32ArrayBuffer,
-      8,
-      16,
-    ));
-
-    // back
-    const {
-      dInputBuffer,
-      passes: passes2,
-    } = GeluBackwards.newInstance(
-      dOutputBuffer,
-      8, 16,
-      inputBuffer,
-    );
-    await runComputePasses(this.device, passes2);
-    console.log(formatAsMatrix(
-      (await serializeBuffer(this.device, dInputBuffer)).float32ArrayBuffer,
-      8,
-      16,
-    ));
+    const resBuffer = await window.model.testLayer();
   }
 }
 

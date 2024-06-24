@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 
 # change seed
-torch.manual_seed(417389472398472378)
+torch.manual_seed(42)
 
 n_layer = 2
 n_head = 4
@@ -18,14 +18,14 @@ weights_dict['transformer.wte.weight'] = torch.randn(vocab_size, n_embd)
 weights_dict['transformer.wpe.weight'] = torch.randn(n_ctx, n_embd)
 
 for layer in range(n_layer):
-    weights_dict[f'transformer.h.{layer}.ln_1.weight'] = torch.randn(n_embd)
-    weights_dict[f'transformer.h.{layer}.ln_1.bias'] = torch.randn(n_embd)
+    weights_dict[f'transformer.h.{layer}.ln_1.weight'] = torch.ones(n_embd)
+    weights_dict[f'transformer.h.{layer}.ln_1.bias'] = torch.zeros(n_embd)
     weights_dict[f'transformer.h.{layer}.attn.c_attn.weight'] = torch.randn(3 * n_embd, n_embd).T
     weights_dict[f'transformer.h.{layer}.attn.c_attn.bias'] = torch.randn(3 * n_embd)
     weights_dict[f'transformer.h.{layer}.attn.c_proj.weight'] = torch.randn(n_embd, n_embd).T
     weights_dict[f'transformer.h.{layer}.attn.c_proj.bias'] = torch.randn(n_embd)
-    weights_dict[f'transformer.h.{layer}.ln_2.weight'] = torch.randn(n_embd)
-    weights_dict[f'transformer.h.{layer}.ln_2.bias'] = torch.randn(n_embd)
+    weights_dict[f'transformer.h.{layer}.ln_2.weight'] = torch.ones(n_embd)
+    weights_dict[f'transformer.h.{layer}.ln_2.bias'] = torch.zeros(n_embd)
     weights_dict[f'transformer.h.{layer}.mlp.c_fc.weight'] = torch.randn(4 * n_embd, n_embd).T
     weights_dict[f'transformer.h.{layer}.mlp.c_fc.bias'] = torch.randn(4 * n_embd)
     weights_dict[f'transformer.h.{layer}.mlp.c_proj.weight'] = torch.randn(n_embd, 4 * n_embd).T

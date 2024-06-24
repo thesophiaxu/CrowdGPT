@@ -158,7 +158,7 @@ class FastMatMulBlockBatchedClass extends Block {
 
   // TODO: work for bigger batch sizes
   newInstance(rows, cols, shared, inputBuffer, weightsBuffer, biasBuffer, batchSize) {
-    if (cols % 16 !== 0 || rows % 16 !== 0 || shared % 16 !== 0) throw new Error(`${JSON.stringify({rows, cols, shared})} - Cols must be divisible by 16.`); // Is this not 8? Or is it 16?
+    if (cols % 8 !== 0 || rows % 8 !== 0 || shared % 8 !== 0) throw new Error(`${JSON.stringify({rows, cols, shared})} - Cols must be divisible by 16.`); // Is this not 8? Or is it 16?
     const hasBias = biasBuffer !== undefined;
     const pipeline = this.getPipeline(hasBias);
     const uniformBuffer = this.initUniform(6, [[0, new Uint32Array([rows, cols, shared, Math.ceil(cols / 4), Math.ceil(shared / 4), batchSize])]]);
@@ -1020,7 +1020,7 @@ class LayerNormBackwardsClass extends Block {
       var dnorm_norm_mean: f32 = 0.0;
       for (var i: u32 = 0; i < N; i += 1) {
         let norm_bi: f32 = (input_array[row * N + i] - stats_array[row * 2]) / stats_array[row * 2 + 1];
-        let dnorm_i: f32 = gamma_array[i] * dOutput_array[row * M + i];
+        let dnorm_i: f32 = gamma_array[i] * dOutput_array[row * N + i];
         dnorm_mean += dnorm_i;
         dnorm_norm_mean += dnorm_i * norm_bi;
       }
@@ -1370,7 +1370,12 @@ class GeluBackwardsClass extends Block {
       let sech_out: vec4<f32> = vec4<f32>(1.0) / (cosh_out * cosh_out);
       let local_grad: vec4<f32> = HALF * (vec4<f32>(1.0) + tanh_out)
         + x * HALF * sech_out * SQRPI * (vec4<f32>(1.0) + vec4<f32>(3.0) * COEFF * x * x);
-      return local_grad * dout;
+      let result = local_grad * dout;
+
+      let lt_mask: vec4<bool> = x < LOW_THRESHOLD;
+      let gt_mask: vec4<bool> = x > HIGH_THRESHOLD;
+  
+      return select(select(result, ZERO, lt_mask), dout, gt_mask);
     }
 
     @group(1) @binding(0) var<storage,read> dOutput_array: array<vec4<f32>>;
