@@ -54,11 +54,11 @@ class GPT2Tokenizer extends Tokenizer {
     this.textDecoder = new TextDecoder("utf-8");
   }
 
-  async load() {
+  async load(variant = null) {
     console.log("Loading GPT2 tokenizer...");
 
     const bpe_file = await (await fetch("weights/tokenization/vocab.bpe")).text();
-    const encoder = await (await fetch("weights/tokenization/gpt_tokens.json")).json();
+    const encoder = await (await fetch(`weights/tokenization/gpt_tokens${variant ? `_${variant}` : ""}.json`)).json();
     this.encoder = encoder;
 
     console.log("Building decoder...");

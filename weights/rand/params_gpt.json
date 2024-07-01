@@ -4,6 +4,6 @@
   "n_embd": 128,
   "n_ctx": 64,
   "bias": true,
-  "vocab_size": 65,
+  "vocab_size": 72,
   "dropout": 0.0
 }

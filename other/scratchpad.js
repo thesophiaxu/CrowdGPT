@@ -680,25 +680,25 @@ class TestGPT {
     const dLossesBuffer = this.initBuffer(['storage', 'copy_from', 'copy_to'], 640);
     this.device.queue.writeBuffer(dLossesBuffer, 0, dLosses);
     
-    const { dLogitsBuffer, passes: passes2 } = CrossEntropyBackwards.newInstance(
-      dLossesBuffer,
-      caches,
-      640,
-      7680,
-      aBuffer,
-      bBuffer,
-    );
-    await runComputePasses(this.device, passes2);
-    console.log(formatAsMatrix(
-      (await serializeBuffer(this.device, caches.probsBuffer)).float32ArrayBuffer,
-      640,
-      7680,
-    ));
-    console.log(formatAsMatrix(
-      (await serializeBuffer(this.device, dLogitsBuffer)).float32ArrayBuffer,
-      640,
-      7680,
-    ));
+    // const { dLogitsBuffer, passes: passes2 } = CrossEntropyBackwards.newInstance(
+    //   dLossesBuffer,
+    //   caches,
+    //   640,
+    //   7680,
+    //   aBuffer,
+    //   bBuffer,
+    // );
+    // await runComputePasses(this.device, passes2);
+    // console.log(formatAsMatrix(
+    //   (await serializeBuffer(this.device, caches.probsBuffer)).float32ArrayBuffer,
+    //   640,
+    //   7680,
+    // ));
+    // console.log(formatAsMatrix(
+    //   (await serializeBuffer(this.device, dLogitsBuffer)).float32ArrayBuffer,
+    //   640,
+    //   7680,
+    // ));
   }
 
   async testLayerNorm() {
@@ -769,7 +769,7 @@ class TestGPT {
 async function test() {
   const GPU = new TestGPT();
   await GPU.initialize();
-  await GPU.testMisc();
+  await GPU.testSoftmax();
 }
 
 /*

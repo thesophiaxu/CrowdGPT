@@ -16,11 +16,12 @@ const SoftmaxBackwards = new SoftmaxBackwardsClass();
 const TransposeBlock = new TransposeBlockClass();
 const CrossEntropyLoss = new CrossEntropyLossClass();
 const CrossEntropyBackwards = new CrossEntropyBackwardsClass();
+const AdamWBlock = new AdamWBlockClass();
 
 // Needed for deletion.
 let operations = [FastMatMulBlock, FastMatMulBatchedBlock, FastMatMulBackwards, AttentionBlock, AttentionBackwards,
   ResidualBlock, EmbedBlock, EmbedBackwards, DeEmbedBlock, GeluBlock, GeluBackwards, LayerNormBlock, LayerNormBackwards, SoftmaxBlock, SoftmaxBackwards, TransposeBlock,
-  CrossEntropyLoss, CrossEntropyBackwards];
+  CrossEntropyLoss, CrossEntropyBackwards, AdamWBlock];
 
 function initializeOperations(device) {
   for (const operation of operations) operation.initialize(device);

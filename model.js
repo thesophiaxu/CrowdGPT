@@ -42,6 +42,11 @@ async function serializeBuffer(device, buffer) {
   }
 }
 
+async function fmt(buffer, x, y) {
+  const serialized = await serializeBuffer(window.ddevice, buffer);
+  console.log(formatAsMatrix(serialized.float32ArrayBuffer, x, y));
+}
+
 async function deserializeBuffer(device, buffer) {
   if (buffer._type !== "GPUBuffer") throw new Error("Unexpected buffer type");
   const resBuffer = device.createBuffer({
@@ -90,6 +95,9 @@ class GPT {
     this.externalBuffer;
 
     this.unloadDeletionStack = [];
+    this.paramsDict = {};
+    this.memoryDict = {};
+    this.gradientsDict = {};
   }
 
   async initialize() {
@@ -97,15 +105,21 @@ class GPT {
     if (!navigator.gpu) throw new Error("WebGPU is not supported");
 
     const adapter = await navigator.gpu.requestAdapter();
-    this.device = await adapter.requestDevice();
+    this.device = await adapter.requestDevice({
+      requiredLimits: {
+        maxBufferSize: 1_000_000_000,
+        maxStorageBufferBindingSize: 1_000_000_000
+      },
+    });
+    window.ddevice = this.device;
 
     initializeOperations(this.device);
 
     [this.model, this.params] = await this.loadModel(this.folder);
-    this.tokenizer = this.tokenizerType == "bpe" ? new GPT2Tokenizer() : new SimpleTokenizer();
-    await this.tokenizer.load();
+    this.tokenizer = this.tokenizerType.startsWith("bpe") ? new GPT2Tokenizer() : new SimpleTokenizer();
+    await this.tokenizer.load(this.tokenizerType === "bpe10k" ? "10k": null);
 
-    if (this.tokenizerType == "bpe") {
+    if (this.tokenizerType.startsWith("bpe")) {
       this.defaultPrompt = `What is the answer to life, the universe, and everything?\n`;
       this.defaultTopK = 3;
       this.defaultTemperature = 1;
@@ -128,6 +142,14 @@ class GPT {
     this.training = false;
   }
 
+  initBuffer(ops, row, col = 1) {
+    const buffer = this.device.createBuffer({
+      size: this.bufferSize(row, col),
+      usage: ops.map((u) => bufferUsageDict[u]).reduce((a, b) => a | b),
+    });
+    return buffer;
+  }
+
   async *generate(prompt, max_new_tokens, top_k, temperature) {
     if (!this.initialized) {
       console.error("Model not loaded yet");
@@ -148,7 +170,7 @@ class GPT {
       const useAttCache = i !== 0 && history.length <= this.params.n_ctx;
 
       const startTime = performance.now();
-      const logits = await this.run(idx_cond, useAttCache);
+      const logits = await this.run(idx_cond);
       const endTime = performance.now();
 
       // console.log(`\nIteration ${i + 1} of ${max_new_tokens}`);
@@ -179,7 +201,7 @@ class GPT {
     console.log(`Average kernel execution time: ${totalTime / (max_new_tokens - warmupRuns)} ms`);
   }
 
-  async run(idx) {
+  async run(idx, train = false) {
     const { posEmbdBuffer, normGammaBuffer, normBetaBuffer, embeddingsBuffers, deEmbeddingsBuffers } = this.model;
     const { n_embd, n_layer, vocab_size, vocab_chunk_size, vocab_chunk_instances } = this.params;
     if (idx.length % 16 !== 0) {
@@ -193,14 +215,14 @@ class GPT {
 
     // Pipeline creation is major bottleneck to spin up speed! Also buffer re-use.
 
-    this.computePasses = [];
+    let computePasses = [];
     let intermediateBuffer;
     let residualBuffer;
     {
       const { passes, resultBuffer } = EmbedBlock.newInstance(idx, seq_length, n_embd, vocab_chunk_size, embeddingsBuffers, posEmbdBuffer, ResidualBlock);
       intermediateBuffer = resultBuffer;
       residualBuffer = resultBuffer;
-      this.computePasses.push(...passes);
+      computePasses.push(...passes);
     }
     const midPoint = Math.floor(n_layer / 2);
 
@@ -216,8 +238,8 @@ class GPT {
         intermediateBuffer = resultBuffers.intermediateBuffer;
         residualBuffer = resultBuffers.intermediateBuffer;
       }
-      await runComputePasses(this.device, this.computePasses);
-      this.computePasses = [];
+      await runComputePasses(this.device, computePasses);
+      computePasses = [];
 
       // TEST 2/2 Run remotely
       const remoteResults = await this.runLayersOnOthers({
@@ -239,12 +261,13 @@ class GPT {
         })
         intermediateBuffer = resultBuffers.intermediateBuffer;
         residualBuffer = resultBuffers.intermediateBuffer;
+        computePasses.push(...resultBuffers.passes);
       }
     }
 
     {
       if (this.externalBuffer) {
-        this.computePasses.push({
+        computePasses.push({
           flag: "copy",
           src: intermediateBuffer,
           srcOffset: 0,
@@ -255,39 +278,248 @@ class GPT {
       }
     }
     {
-      const { passes, resultBuffer } = LayerNormBlock.newInstance(seq_length, n_embd, intermediateBuffer, normGammaBuffer, normBetaBuffer);
+      this.finalLayerNormInput = intermediateBuffer;
+      const { passes, caches, resultBuffer } = LayerNormBlock.newInstance(seq_length, n_embd, intermediateBuffer, normGammaBuffer, normBetaBuffer);
+      this.finalLayerNormOutput = resultBuffer;
       intermediateBuffer = resultBuffer;
-      this.computePasses.push(...passes);
+      computePasses.push(...passes);
+      this.finalLayerNormStats = caches.statsResultBuffer;
     }
-    {
-      const { passes, resultBuffer } = DeEmbedBlock.newInstance(
-        n_embd,
-        vocab_size,
-        vocab_chunk_size * vocab_chunk_instances,
-        seq_length,
-        vocab_chunk_size,
-        intermediateBuffer,
-        deEmbeddingsBuffers
-      );
-      intermediateBuffer = resultBuffer;
-      this.computePasses.push(...passes);
-    }
-    const resultBuffer = intermediateBuffer;
-
+    
     // ---------------- Compute Passes ----------------
 
-    await runComputePasses(this.device, this.computePasses);
+    if (!train) {
+      {
+        const { passes, resultBuffer } = DeEmbedBlock.newInstance(
+          n_embd,
+          vocab_size,
+          vocab_chunk_size * vocab_chunk_instances,
+          seq_length,
+          vocab_chunk_size,
+          intermediateBuffer,
+          deEmbeddingsBuffers
+        );
+        intermediateBuffer = resultBuffer;
+        computePasses.push(...passes);
+      }
+
+      const resultBuffer = intermediateBuffer;
+
+      await runComputePasses(this.device, computePasses);
+
+      // ---------------- Read Results ----------------
+
+      await resultBuffer.mapAsync(GPUMapMode.READ);
+      const output = resultBuffer.getMappedRange();
+      const outputArray = new Float32Array(output).slice(0); // Copy the array, otherwise it'll be destroyed.
+
+      clearOperationCache();
+
+      return outputArray;
+    } else {
+      const { passes, resultBuffer } = FastMatMulBatchedBlock.newInstance(
+        seq_length,
+        vocab_size,
+        n_embd,
+        intermediateBuffer,
+        deEmbeddingsBuffers[0],
+        undefined,
+        1,
+      )
+      computePasses.push(...passes);
+      //clearOperationCache();
+      return { resultBuffer, passes: computePasses, caches: {
+        finalLayerNormInput: this.finalLayerNormInput,
+        finalLayerNormOutput: this.finalLayerNormOutput,
+        finalLayerNormStats: this.finalLayerNormStats,
+      } };
+    }
+  }
+
+  clearGradients() {
+    for (const key in this.paramsDict) {
+      if (key.startsWith("lm_head")) continue;
+      this.gradientsDict[key] = [];
+    }
+  }
+
+  async runBackwards(
+    outputsBuffer, // seq_length x vocab_size
+    targets, // seq_length array
+    idx,
+    caches,
+    oneHotBuffer,
+    batchSize,
+    params_dict,
+  ) {
+    const { posEmbdBuffer, normGammaBuffer, normBetaBuffer, embeddingsBuffers, deEmbeddingsBuffers } = this.model;
+    const { n_embd, n_layer, vocab_size, vocab_chunk_size, vocab_chunk_instances } = this.params;
+    if (idx.length % 16 !== 0) {
+      idx = [...new Array(Math.ceil(idx.length / 16) * 16 - idx.length).fill(0), ...idx]
+    }
+    const seq_length = idx.length;
+
+    const targetsBuffer = this.initBuffer(['storage', 'copy_from', 'copy_to'], seq_length);
+    this.device.queue.writeBuffer(targetsBuffer, 0, new Uint32Array(targets));
+    const {
+      resultBuffer,
+      caches: crossEntropyCaches,
+      passes: crossEntropyForwardPasses,
+    } = CrossEntropyLoss.newInstance(
+      seq_length,
+      vocab_size,
+      outputsBuffer,
+      targetsBuffer,
+    );
+    
+    const getLosses = async () => (await serializeBuffer(this.device, resultBuffer)).float32ArrayBuffer;
     
 
-    // ---------------- Read Results ----------------
+    // now backwards
+    const dLosses = new Float32Array(new Array(seq_length).fill(1/(seq_length * batchSize)));
+    const dLossesBuffer = this.initBuffer(['storage', 'copy_from', 'copy_to'], seq_length);
+    this.device.queue.writeBuffer(dLossesBuffer, 0, dLosses);
 
-    await resultBuffer.mapAsync(GPUMapMode.READ);
-    const output = resultBuffer.getMappedRange();
-    const outputArray = new Float32Array(output).slice(0); // Copy the array, otherwise it'll be destroyed.
+    const { 
+      dLogitsBuffer, // seq_length x vocab_size
+      passes: crossEntropyBackwardPasses
+    } = CrossEntropyBackwards.newInstance(
+      dLossesBuffer,
+      crossEntropyCaches,
+      seq_length,
+      vocab_size,
+      outputsBuffer,
+      targetsBuffer,
+    );
 
-    clearOperationCache();
+    const {
+      passes: deEmbeddingsPasses,
+      dInputBuffer: dDeEmbeddingsInputBuffer,
+      dWeightsBuffer: dDeEmbeddingsBuffer,
+    } = FastMatMulBackwards.newInstance(
+      dLogitsBuffer,
+      seq_length,
+      vocab_size,
+      n_embd,
+      caches.finalLayerNormOutput,
+      deEmbeddingsBuffers[0],
+      undefined,
+    )
 
-    return outputArray;
+    const {
+      dBetaBuffer: dFinalBetaBuffer,
+      dGammaBuffer: dFinalGammaBuffer,
+      dInputBuffer: dFinalLayerOutputBuffer,
+      passes: layerNormBackwardPasses,
+    } = LayerNormBackwards.newInstance(
+      dDeEmbeddingsInputBuffer,
+      { statsResultBuffer: caches.finalLayerNormStats },
+      seq_length,
+      n_embd,
+      caches.finalLayerNormInput,
+      normGammaBuffer,
+      normBetaBuffer,
+    )
+
+    let dLayerOutputBuffer = dFinalLayerOutputBuffer;
+    let layersBackwards = [];
+    let layersPasses = [];
+    for (let i = n_layer-1; i >= 0; i--) {
+      const layerBackwards = await this.layerBackwards({
+        layer: i,
+        dOutputBuffer: dLayerOutputBuffer,
+        seq_length,
+      })
+      layersBackwards[i] = layerBackwards;
+      layersPasses.push(...layerBackwards.passes);
+      dLayerOutputBuffer = layerBackwards.dInputBuffer;
+    }
+
+    const buffersToDelete = [
+      targetsBuffer,
+      dLossesBuffer,
+    ]
+    this.unloadDeletionStack.push(...buffersToDelete);
+
+    const {
+      passes: embeddingsPasses,
+      dWeightsBuffer: dEmbeddingsBuffer,
+    } = FastMatMulBackwards.newInstance(
+      dLayerOutputBuffer,
+      seq_length,
+      n_embd,
+      vocab_size,
+      oneHotBuffer,
+      embeddingsBuffers[0],
+      undefined,
+    )
+
+    // get joined gradients for embedding / deembedding
+    const {
+      resultBuffer: dDeEmbeddingsBufferTransposed,
+      passes: dDeEmbeddingsTransposePasses
+    } = TransposeBlock.newInstance(
+      n_embd,
+      vocab_size,
+      dDeEmbeddingsBuffer,
+    )
+
+    const {
+      resultBuffer: dJoinedEmbBuffer,
+      passes: dJoinedEmbPasses
+    } = ResidualBlock.newInstance(
+        model.params.vocab_size,
+        model.params.n_embd,
+        dEmbeddingsBuffer,
+        dDeEmbeddingsBufferTransposed,
+    )
+
+    // set gradientsDict
+    this.gradientsDict[`wte`].push(dJoinedEmbBuffer);
+    this.gradientsDict[`ln_f.weight`].push(dFinalGammaBuffer);
+    // fmt(dFinalBetaBuffer, 72, 1);
+    // fmt(dFinalGammaBuffer, 72, 1);
+    this.gradientsDict[`ln_f.bias`].push(dFinalBetaBuffer);
+    for (let i = n_layer-1; i >= 0; i--) {
+      this.gradientsDict[`h.${i}.attn.q.weight`].push(layersBackwards[i].dAttentionQWeightBuffer);
+      this.gradientsDict[`h.${i}.attn.q.bias`].push(layersBackwards[i].dAttentionQBiasBuffer);
+      this.gradientsDict[`h.${i}.attn.k.weight`].push(layersBackwards[i].dAttentionKWeightBuffer);
+      this.gradientsDict[`h.${i}.attn.k.bias`].push(layersBackwards[i].dAttentionKBiasBuffer);
+      this.gradientsDict[`h.${i}.attn.v.weight`].push(layersBackwards[i].dAttentionVWeightBuffer);
+      this.gradientsDict[`h.${i}.attn.v.bias`].push(layersBackwards[i].dAttentionVBiasBuffer);
+      this.gradientsDict[`h.${i}.attn.c_proj.weight`].push(layersBackwards[i].dAttentionLinearWeightBuffer);
+      this.gradientsDict[`h.${i}.attn.c_proj.bias`].push(layersBackwards[i].dAttentionLinearBiasBuffer);
+      this.gradientsDict[`h.${i}.ln_1.weight`].push(layersBackwards[i].dLn1WeightBuffer);
+      this.gradientsDict[`h.${i}.ln_1.bias`].push(layersBackwards[i].dLn1BiasBuffer);
+      this.gradientsDict[`h.${i}.ln_2.weight`].push(layersBackwards[i].dLn2WeightBuffer);
+      this.gradientsDict[`h.${i}.ln_2.bias`].push(layersBackwards[i].dLn2BiasBuffer);
+      this.gradientsDict[`h.${i}.mlp.c_fc.weight`].push(layersBackwards[i].dMlp1WeightBuffer);
+      this.gradientsDict[`h.${i}.mlp.c_fc.bias`].push(layersBackwards[i].dMlp1BiasBuffer);
+      this.gradientsDict[`h.${i}.mlp.c_proj.weight`].push(layersBackwards[i].dMlp2WeightBuffer);
+      this.gradientsDict[`h.${i}.mlp.c_proj.bias`].push(layersBackwards[i].dMlp2BiasBuffer);
+    }
+
+
+    return {
+      getLosses,
+      caches,
+      dFinalBetaBuffer,
+      dFinalGammaBuffer,
+      dFinalLayerOutputBuffer,
+      layersBackwards,
+      dEmbeddingsBuffer,
+      dDeEmbeddingsBuffer,
+      passes: [
+        ...crossEntropyForwardPasses,
+        ...crossEntropyBackwardPasses,
+        ...deEmbeddingsPasses,
+        ...layerNormBackwardPasses,
+        ...layersPasses,
+        ...embeddingsPasses,
+        ...dDeEmbeddingsTransposePasses,
+        ...dJoinedEmbPasses,
+      ]
+    }
   }
 
   async runLayersForOthers({
@@ -341,7 +573,11 @@ class GPT {
     const i = layer;
     const buffers = layer_buffers[i];
     const caches = layer_caches[i];
+    const computePasses = [];
     let residualBuffer = intermediateBuffer;
+    if (this.training) {
+      caches.inputBuffer = intermediateBuffer;
+    }
     // console.log('Data transfer overhead: ', Date.now() - t0, ' ms');
     {
       const { passes, caches: lnCaches, resultBuffer } = LayerNormBlock.newInstance(
@@ -355,7 +591,7 @@ class GPT {
         caches.layerNorm1StatsResultBuffer = lnCaches.statsResultBuffer;
       }
       intermediateBuffer = resultBuffer;
-      this.computePasses.push(...passes);
+      computePasses.push(...passes);
     }
     {
       const { passes, tmpBuffer, caches: attnCaches, resultBuffer } = AttentionBlock.newFusedInstance(
@@ -381,10 +617,10 @@ class GPT {
         caches.attentionInputBuffer = intermediateBuffer;
       }
       intermediateBuffer = resultBuffer;
-      this.computePasses.push(...passes);
+      computePasses.push(...passes);
 
-      // await runComputePasses(this.device, this.computePasses);
-      // this.computePasses = [];
+      // await runComputePasses(this.device, computePasses);
+      // computePasses = [];
       // console.log(i);
       // console.log(formatAsMatrix(
       //   (await serializeBuffer(this.device, tmpBuffer)).float32ArrayBuffer,
@@ -396,7 +632,7 @@ class GPT {
       const { passes, resultBuffer } = ResidualBlock.newInstance(seq_length, n_embd, intermediateBuffer, residualBuffer);
       intermediateBuffer = resultBuffer;
       residualBuffer = resultBuffer;
-      this.computePasses.push(...passes);
+      computePasses.push(...passes);
     }
     {
       const { passes, caches: lnCaches, resultBuffer } = LayerNormBlock.newInstance(
@@ -411,7 +647,7 @@ class GPT {
         caches.layerNorm2InputBuffer = intermediateBuffer;
       }
       intermediateBuffer = resultBuffer;
-      this.computePasses.push(...passes);
+      computePasses.push(...passes);
     }
     {
       const { resultBuffer, passes } = FastMatMulBlock.newInstance(
@@ -427,13 +663,13 @@ class GPT {
         caches.mlp1InputBuffer = intermediateBuffer;
       }
       intermediateBuffer = resultBuffer;
-      this.computePasses.push(...passes);
+      computePasses.push(...passes);
       
     }
     {
       const { resultBuffer, passes } = GeluBlock.newInstance(seq_length, hidden_size, intermediateBuffer);
       intermediateBuffer = resultBuffer;
-      this.computePasses.push(...passes);
+      computePasses.push(...passes);
     }
     {
       const { resultBuffer, passes } = FastMatMulBlock.newInstance(
@@ -446,17 +682,17 @@ class GPT {
       );
       if (this.training) caches.mlp2InputBuffer = intermediateBuffer;
       intermediateBuffer = resultBuffer;
-      this.computePasses.push(...passes);
+      computePasses.push(...passes);
     }
     {
       const { passes, resultBuffer } = ResidualBlock.newInstance(seq_length, n_embd, intermediateBuffer, residualBuffer);
       intermediateBuffer = resultBuffer;
       residualBuffer = resultBuffer;
-      this.computePasses.push(...passes);
+      computePasses.push(...passes);
     }
     // if (i % 2 === 0) {
-    //   await runComputePasses(this.device, this.computePasses);
-    //   this.computePasses = [];
+    //   await runComputePasses(this.device, computePasses);
+    //   computePasses = [];
     //   const t0 = Date.now();
     //   const sb1 = await serializeBuffer(this.device, intermediateBuffer);
     //   const sb2 = await serializeBuffer(this.device, residualBuffer);
@@ -465,14 +701,13 @@ class GPT {
     //   //console.log(sb);
     //   console.log('Data serialize overhead: ', Date.now() - t0, ' ms');
     // }
-    return { intermediateBuffer };
+    return { intermediateBuffer, passes: computePasses };
   }
 
   async layerBackwards({
     layer,
     dOutputBuffer,
     seq_length,
-    inputBuffer,
   }) {
     const { layer_buffers, layer_caches } = this.model;
     const { attention_scale, n_embd, n_head, head_size, hidden_size } = this.params;
@@ -489,6 +724,7 @@ class GPT {
       attentionInputBuffer,
       attentionCaches,
       layerNorm1StatsResultBuffer,
+      inputBuffer,
     } = cache;
 
     const dMlp2OutputBuffer = dOutputBuffer;
@@ -802,11 +1038,24 @@ class GPT {
       }
       paddedArray.set(embeddingWeights.subarray(offset * params.n_embd, offset * params.n_embd + size * params.n_embd));
 
-      embeddingsBuffers.push(this.initTensor(paddedArray, [params.vocab_chunk_size, params.n_embd], ["copy_from"]));
+      const embBuffer = this.initTensor(paddedArray, [params.vocab_chunk_size, params.n_embd], ["storage", "copy_from", "copy_to"]);
+      embeddingsBuffers.push(embBuffer);
 
-      const chunk = transpose(paddedArray, params.vocab_chunk_size, params.n_embd); // Use GPU perhaps?
-      deEmbeddingsBuffers.push(this.initTensor(chunk, [params.n_embd, params.vocab_chunk_size], ["storage"]));
+      //const chunk = transpose(paddedArray, params.vocab_chunk_size, params.n_embd); // Use GPU perhaps?
+      const { resultBuffer: deembBuffer, passes } = TransposeBlock.newInstance(
+        params.vocab_chunk_size,
+        params.n_embd,
+        embBuffer,
+        undefined,
+        true
+      );
+      this.unloadDeletionStack.push(deembBuffer);
+      await runComputePasses(this.device, passes);
+      deEmbeddingsBuffers.push(deembBuffer);
     }
+
+    this.paramsDict[`wte`] = embeddingsBuffers[0];
+    this.paramsDict[`lm_head.weight`] = deEmbeddingsBuffers[0];
 
     return { embeddingsBuffers, deEmbeddingsBuffers };
   }
@@ -816,6 +1065,8 @@ class GPT {
     const posEmbeddings = await fetchBin(`${weightsFolder}/transformer.wpe.weight_gpt.bin`);
     const posEmbdBuffer = this.initTensor(posEmbeddings, [params.n_ctx, params.n_embd], ["copy_from"]);
 
+    this.paramsDict[`wpe`] = posEmbdBuffer;
+
     return { posEmbdBuffer };
   }
 
@@ -824,11 +1075,14 @@ class GPT {
     const prefix = `${weightsFolder}/transformer.ln_f.`;
 
     const tensorPromises = [
-      this.fetchAndInitTensor(`${prefix}weight_gpt.bin`, [params.n_embd], ["storage"]),
-      this.fetchAndInitTensor(`${prefix}bias_gpt.bin`, [params.n_embd], ["storage"]),
+      this.fetchAndInitTensor(`${prefix}weight_gpt.bin`, [params.n_embd], ["storage", "copy_from", "copy_to"]),
+      this.fetchAndInitTensor(`${prefix}bias_gpt.bin`, [params.n_embd], ["storage", "copy_from", "copy_to"]),
     ];
 
     const [normGammaBuffer, normBetaBuffer] = await Promise.all(tensorPromises);
+
+    this.paramsDict[`ln_f.weight`] = normGammaBuffer;
+    this.paramsDict[`ln_f.bias`] = normBetaBuffer;
 
     return { normGammaBuffer, normBetaBuffer };
   }
@@ -851,18 +1105,18 @@ class GPT {
 
     // Create an array of promises for fetching and initializing the tensors
     const tensorPromises = [
-      this.fetchAndInitTensor(`${prefix}ln_1.weight_gpt.bin`, [params.n_embd], ["storage"]),
-      this.fetchAndInitTensor(`${prefix}ln_1.bias_gpt.bin`, [params.n_embd], ["storage"]),
-      this.fetchAndSplitQKVWeightTensors(`${prefix}attn.c_attn.weight_gpt.bin`, [params.n_embd, 3 * params.n_embd], ["storage"]),
-      this.fetchAndSplitQKVBiasTensors(`${prefix}attn.c_attn.bias_gpt.bin`, [params.n_embd], ["storage"]),
-      this.fetchAndInitTensor(`${prefix}attn.c_proj.weight_gpt.bin`, [params.n_embd, params.n_embd], ["storage"]),
-      this.fetchAndInitTensor(`${prefix}attn.c_proj.bias_gpt.bin`, [params.n_embd], ["storage"]),
-      this.fetchAndInitTensor(`${prefix}ln_2.weight_gpt.bin`, [params.n_embd], ["storage"]),
-      this.fetchAndInitTensor(`${prefix}ln_2.bias_gpt.bin`, [params.n_embd], ["storage"]),
-      this.fetchAndInitTensor(`${prefix}mlp.c_fc.weight_gpt.bin`, [params.n_embd, params.hidden_size], ["storage"]),
-      this.fetchAndInitTensor(`${prefix}mlp.c_fc.bias_gpt.bin`, [params.hidden_size], ["storage"]),
-      this.fetchAndInitTensor(`${prefix}mlp.c_proj.weight_gpt.bin`, [params.hidden_size, params.n_embd], ["storage"]),
-      this.fetchAndInitTensor(`${prefix}mlp.c_proj.bias_gpt.bin`, [params.n_embd], ["storage"]),
+      this.fetchAndInitTensor(`${prefix}ln_1.weight_gpt.bin`, [params.n_embd], ["storage", "copy_from", "copy_to"]),
+      this.fetchAndInitTensor(`${prefix}ln_1.bias_gpt.bin`, [params.n_embd], ["storage", "copy_from", "copy_to"]),
+      this.fetchAndSplitQKVWeightTensors(`${prefix}attn.c_attn.weight_gpt.bin`, [params.n_embd, 3 * params.n_embd], ["storage", "copy_from", "copy_to"]),
+      this.fetchAndSplitQKVBiasTensors(`${prefix}attn.c_attn.bias_gpt.bin`, [params.n_embd], ["storage", "copy_from", "copy_to"]),
+      this.fetchAndInitTensor(`${prefix}attn.c_proj.weight_gpt.bin`, [params.n_embd, params.n_embd], ["storage", "copy_from", "copy_to"]),
+      this.fetchAndInitTensor(`${prefix}attn.c_proj.bias_gpt.bin`, [params.n_embd], ["storage", "copy_from", "copy_to"]),
+      this.fetchAndInitTensor(`${prefix}ln_2.weight_gpt.bin`, [params.n_embd], ["storage", "copy_from", "copy_to"]),
+      this.fetchAndInitTensor(`${prefix}ln_2.bias_gpt.bin`, [params.n_embd], ["storage", "copy_from", "copy_to"]),
+      this.fetchAndInitTensor(`${prefix}mlp.c_fc.weight_gpt.bin`, [params.n_embd, params.hidden_size], ["storage", "copy_from", "copy_to"]),
+      this.fetchAndInitTensor(`${prefix}mlp.c_fc.bias_gpt.bin`, [params.hidden_size], ["storage", "copy_from", "copy_to"]),
+      this.fetchAndInitTensor(`${prefix}mlp.c_proj.weight_gpt.bin`, [params.hidden_size, params.n_embd], ["storage", "copy_from", "copy_to"]),
+      this.fetchAndInitTensor(`${prefix}mlp.c_proj.bias_gpt.bin`, [params.n_embd], ["storage", "copy_from", "copy_to"]),
     ];
 
     // Wait for all tensors to be fetched and initialized
@@ -880,6 +1134,23 @@ class GPT {
       secondLayerWeightsBuffer,
       secondLayerBiasBuffer,
     ] = await Promise.all(tensorPromises);
+
+    this.paramsDict[`h.${layerIndex}.attn.q.weight`] = qkvWeightArray[0];
+    this.paramsDict[`h.${layerIndex}.attn.q.bias`] = qkvBiasArray[0];
+    this.paramsDict[`h.${layerIndex}.attn.k.weight`] = qkvWeightArray[1];
+    this.paramsDict[`h.${layerIndex}.attn.k.bias`] = qkvBiasArray[1];
+    this.paramsDict[`h.${layerIndex}.attn.v.weight`] = qkvWeightArray[2];
+    this.paramsDict[`h.${layerIndex}.attn.v.bias`] = qkvBiasArray[2];
+    this.paramsDict[`h.${layerIndex}.attn.c_proj.weight`] = linearWeightsBuffer;
+    this.paramsDict[`h.${layerIndex}.attn.c_proj.bias`] = linearBiasBuffer;
+    this.paramsDict[`h.${layerIndex}.ln_1.weight`] = normAttentionGammaBuffer;
+    this.paramsDict[`h.${layerIndex}.ln_1.bias`] = normAttentionBetaBuffer;
+    this.paramsDict[`h.${layerIndex}.ln_2.weight`] = normLinearGammaBuffer;
+    this.paramsDict[`h.${layerIndex}.ln_2.bias`] = normLinearBetaBuffer;
+    this.paramsDict[`h.${layerIndex}.mlp.c_fc.weight`] = firstLayerWeightsBuffer;
+    this.paramsDict[`h.${layerIndex}.mlp.c_fc.bias`] = firstLayerBiasBuffer;
+    this.paramsDict[`h.${layerIndex}.mlp.c_proj.weight`] = secondLayerWeightsBuffer;
+    this.paramsDict[`h.${layerIndex}.mlp.c_proj.bias`] = secondLayerBiasBuffer;
 
     // Process the fetched data and return the layer buffers
     return {

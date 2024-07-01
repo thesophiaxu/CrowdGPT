@@ -69,8 +69,11 @@ class Block {
       size: this.bufferSize(dims[0], dims[1] || 1, dims[2] || 1),
       usage: ops.map((u) => bufferUsageDict[u]).reduce((a, b) => a | b),
     });
-    if (!this.boundBufferCache.has(key)) this.boundBufferCache.set(key, []);
-    this.boundBufferCache.get(key).push(buffer);
+    //console.log(ops, dims, key)
+    if (key !== null) {
+      if (!this.boundBufferCache.has(key)) this.boundBufferCache.set(key, []);
+      this.boundBufferCache.get(key).push(buffer);
+    }
     return buffer;
   }
 
@@ -80,25 +83,27 @@ class Block {
     return size;
   }
 
+  bg(types) {
+    return this.device.createBindGroupLayout({
+      entries: types.map((entry, i) => ({
+        binding: i,
+        visibility: GPUShaderStage.COMPUTE,
+        buffer: { type: entry },
+      })),
+    });
+  }
+
   // Could be removed with auto bind groups, currently initializing everytime so probably slowing things down.
   initBindGroups() {
-    const bg = (types) =>
-      this.device.createBindGroupLayout({
-        entries: types.map((entry, i) => ({
-          binding: i,
-          visibility: GPUShaderStage.COMPUTE,
-          buffer: { type: entry },
-        })),
-      });
-
-    this.r_r_r_r_r_Layout = bg(["read-only-storage", "read-only-storage", "read-only-storage", "read-only-storage", "read-only-storage"]);
-    this.r_r_r_r_Layout = bg(["read-only-storage", "read-only-storage", "read-only-storage", "read-only-storage"]);
-    this.r_r_r_Layout = bg(["read-only-storage", "read-only-storage", "read-only-storage"]);
-    this.r_r_Layout = bg(["read-only-storage", "read-only-storage"]);
-    this.r_Layout = bg(["read-only-storage"]);
-    this.u_s_Layout = bg(["uniform", "storage"]);
-    this.u_s_s_Layout = bg(["uniform", "storage", "storage"]);
-    this.u_s_s_s_Layout = bg(["uniform", "storage", "storage", "storage"]);
+    this.r_r_r_r_r_Layout = this.bg(["read-only-storage", "read-only-storage", "read-only-storage", "read-only-storage", "read-only-storage"]);
+    this.r_r_r_r_Layout = this.bg(["read-only-storage", "read-only-storage", "read-only-storage", "read-only-storage"]);
+    this.r_r_r_Layout = this.bg(["read-only-storage", "read-only-storage", "read-only-storage"]);
+    this.r_r_Layout = this.bg(["read-only-storage", "read-only-storage"]);
+    this.r_Layout = this.bg(["read-only-storage"]);
+    this.u_s_Layout = this.bg(["uniform", "storage"]);
+    this.u_s_s_Layout = this.bg(["uniform", "storage", "storage"]);
+    this.u_s_s_s_Layout = this.bg(["uniform", "storage", "storage", "storage"]);
+    this.u_s_s_s_s_Layout = this.bg(["uniform", "storage", "storage", "storage", "storage"]);
   }
 
   initPipeline(code, bindGroupLayouts, label = "", constants = {}) {
@@ -503,13 +508,16 @@ class TransposeBlockClass extends Block {
     return pipeline;
   }
 
-  newInstance(rows, cols, inputBuf, batchSize = 1) {
+  newInstance(rows, cols, inputBuf, batchSize = 1, keepResults = false, transposeInto) {
     const pipeline = this.getPipeline();
     const uniformBuffer = this.initBuffer(["uniform", "copy_to"], [4]);
-    const resultBuffer = this.initBuffer(["storage", "copy_from"], [rows, cols, batchSize]);
+    const resultBuffer = transposeInto ?? this.initBuffer(["storage", "copy_from", "copy_to"], [rows, cols, batchSize], keepResults ? null : undefined);
     const opBindGroup = this.initBindGroup(this.u_s_Layout, [uniformBuffer, resultBuffer], `${this.name}_OpG`);
     const inputBindGroup = this.initBindGroup(this.r_Layout, [inputBuf], `${this.name}_InputG`);
-    const workgroups = { x: wgSize(cols, 8), y: wgSize(rows, 8), z: batchSize };
+    if (inputBuf.usage < 128) {
+      throw new Error("1231")
+    }
+    const workgroups = { x: wgSize(cols, 10), y: wgSize(rows, 10), z: batchSize };
     this.device.queue.writeBuffer(uniformBuffer, 0, new Uint32Array([rows, cols]));
 
     return {
@@ -537,9 +545,9 @@ class TransposeBlockClass extends Block {
     @group(0) @binding(1) var<storage, read_write> result_array: array<f32>;
     
     // Bank conflicts?
-    var<workgroup> tile: array<array<f32, 8>, 8>;
+    var<workgroup> tile: array<array<f32, 10>, 10>;
     
-    @compute @workgroup_size(8, 8)
+    @compute @workgroup_size(10, 10)
     fn main (@builtin(workgroup_id) wg_id: vec3<u32>,  @builtin(local_invocation_id) local_id: vec3<u32>) {
       let col: u32 = wg_id.x;
       let row: u32 = wg_id.y;
@@ -547,8 +555,8 @@ class TransposeBlockClass extends Block {
       let N: u32 = uniforms.N;
       let M: u32 = uniforms.M;
 
-      let tile_col = col * 8u + local_id.x;
-      let tile_row = row * 8u + local_id.y;
+      let tile_col = col * 10u + local_id.x;
+      let tile_row = row * 10u + local_id.y;
     
       // Load a tile from input_array to shared memory tile
       if (tile_row < M && tile_col < N) {
@@ -558,8 +566,8 @@ class TransposeBlockClass extends Block {
       workgroupBarrier(); // Ensure all threads have finished writing to the shared memory before proceeding
     
       // Compute transposed coordinates
-      let transposed_col: u32 = row * 8u + local_id.x;
-      let transposed_row: u32 = col * 8u + local_id.y;
+      let transposed_col: u32 = row * 10u + local_id.x;
+      let transposed_row: u32 = col * 10u + local_id.y;
     
       // Write the transposed tile to result_array
       if (transposed_col < M && transposed_row < N) {
@@ -1183,7 +1191,7 @@ class SoftmaxBackwardsClass extends Block {
     const resultBuffer = this.initBuffer(["storage", "copy_from"], [rows, cols]);
     const bindGroup = this.initBindGroup(this.u_s_Layout, [uniformBuffer, resultBuffer], `${this.name}_OpG`);
     const inputBindGroup = this.initBindGroup(this.r_r_Layout, [outputBuffer, dOutputBuffer])
-    const workgroups = { x: wgSize(rows, 1), y: 1, z: 1 };
+    const workgroups = { x: wgSize(rows, 8), y: wgSize(cols, 8), z: 1 };
 
     return {
       dInputBuffer: resultBuffer,
@@ -1211,22 +1219,27 @@ class SoftmaxBackwardsClass extends Block {
     @group(1) @binding(0) var<storage,read> output_array: array<f32>;
     @group(1) @binding(1) var<storage,read> dOutput_array: array<f32>;
 
-    @compute @workgroup_size(16)
+    @compute @workgroup_size(8, 8)
     fn main(@builtin(workgroup_id) wg_id: vec3<u32>, @builtin(global_invocation_id) global_id: vec3<u32>) {
-      let i: u32 = wg_id.x;
+      let i: u32 = global_id.x;
+      let j: u32 = global_id.y;
       let N: u32 = uniforms.N;
-      for (var j: u32 = 0u; j < N; j = j + 1u) {
-        var result: f32 = 0.0f;
+      let M: u32 = uniforms.M;
 
-        for (var k: u32 = 0u; k < N; k = k + 1u) {
-          var ind: f32 = 0.0f;
-          if (j == k) { ind = 1.0f; }
-          let dLocal = output_array[i * N + j] * (ind - output_array[i * N + k]);
-          result += dLocal * dOutput_array[i * N + k];
-        }
-
-        dInput_array[i * N + j] = result * uniforms.scale;
+      if (i >= M || j >= N) {
+        return;
       }
+
+      var result: f32 = 0.0f;
+
+      for (var k: u32 = 0u; k < N; k = k + 1u) {
+        var ind: f32 = 0.0f;
+        if (j == k) { ind = 1.0f; }
+        let dLocal = output_array[i * N + j] * (ind - output_array[i * N + k]);
+        result += dLocal * dOutput_array[i * N + k];
+      }
+
+      dInput_array[i * N + j] = result * uniforms.scale;
     }
   `
 }
@@ -2540,7 +2553,7 @@ class CrossEntropyLossClass extends Block {
     const lossesBuffer = this.initResultBuffer([seq_length]);
     const myBindGroup = this.initBindGroup(this.u_s_Layout, [myUniformBuffer, lossesBuffer]);
     const myInputBindGroup = this.initBindGroup(this.r_r_Layout, [logitsSoftmaxed, target], `${this.name}_input`);
-    const myWorkgroups = { x: seq_length, y: 1, z: 1 };
+    const myWorkgroups = { x: wgSize(seq_length, 8), y: 1, z: 1 };
 
     return {
       resultBuffer: lossesBuffer,
@@ -2643,6 +2656,114 @@ class CrossEntropyBackwardsClass extends Block {
           pipeline: myPipeline,
           groups: [myBindGroup, myInputBindGroup],
           workgroups: myWorkgroups,
+        }
+      ]
+    }
+  }
+}
+
+class AdamWBlockClass extends Block {
+  constructor() {
+    super();
+    this.name = "adamW";
+  }
+  
+  shader(batchSize, numParameters) {
+    const stmtsAdd = [];
+    for (let i = 0; i < batchSize; ++i) {
+      stmtsAdd.push(`gradients[${i} * ${numParameters} + idx]`);
+    }
+    return `
+    struct Meta {
+        numParameters: u32,
+        learningRate: f32,
+        beta1: f32,
+        beta2: f32,
+        epsilon: f32,
+        t: f32,
+    }
+
+    @binding(1) @group(0) var<storage, read_write> weights: array<f32>;
+    @binding(2) @group(0) var<storage, read_write> mMemory: array<f32>;
+    @binding(3) @group(0) var<storage, read_write> vMemory: array<f32>;
+    @binding(0) @group(0) var<uniform> uniforms: Meta;
+    @binding(4) @group(0) var<storage, read_write> gradients: array<f32>;
+
+    @compute @workgroup_size(128)
+    fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
+        var idx = global_id.x;
+        if (idx >= uniforms.numParameters) {
+          return;
+        }
+
+        var gradient = ${stmtsAdd.join(" + ")};
+        var weight = weights[idx];
+        var mmemory = mMemory[idx];
+        var vmemory = vMemory[idx];
+
+        var m = mmemory * uniforms.beta1 + (1.0 - uniforms.beta1) * gradient;
+        var v = vmemory * uniforms.beta2 + (1.0 - uniforms.beta2) * gradient * gradient;
+        mMemory[idx] = m;
+        vMemory[idx] = v;
+        var m_hat = m / (1.0 - pow(uniforms.beta1, uniforms.t));
+        var v_hat = v / (1.0 - pow(uniforms.beta2, uniforms.t));
+        var weightRes = weight - (uniforms.learningRate * (m_hat / (sqrt(v_hat) + uniforms.epsilon)));
+        
+        weights[idx] = weightRes;
+    }
+  `
+  }
+
+  getPipeline(batchSize, numParameters) {
+    const pipelineCacheKey = `${this.name}_adamw_${numParameters}_${batchSize}`;
+    if (this.pipelineCache.has(pipelineCacheKey)) return this.pipelineCache.get(pipelineCacheKey);
+    const pipeline = this.initPipeline(this.shader(batchSize, numParameters), [
+      this.u_s_s_s_s_Layout,
+    ], `${this.name}_pipeline`);
+    this.pipelineCache.set(pipelineCacheKey, pipeline);
+    return pipeline;
+  }
+
+  newInstance({
+    weightsBuffer,
+    gradientsBuffer,
+    mMemoryBuffer,
+    vMemoryBuffer,
+    numParameters,
+    learningRate,
+    beta1 = 0.9,
+    beta2 = 0.999,
+    epsilon = 1e-6,
+    t
+  }) {
+
+    const myPipeline = this.getPipeline(gradientsBuffer.length, numParameters);
+    const myUniformBuffer = this.initUniform(6, [
+      [0, new Uint32Array([numParameters])],
+      [4, new Float32Array([learningRate, beta1, beta2, epsilon, t+1])],
+    ]);
+    const totalGradientsBuffer = this.initBuffer(["storage", "copy_from", "copy_to"], [gradientsBuffer.length * numParameters]);
+    const copyOps = gradientsBuffer.map((buf, i) => ({
+      flag: "copy",
+      src: buf,
+      srcOffset: 0,
+      dst: totalGradientsBuffer,
+      dstOffset: 4 * i * numParameters,
+      size: 4 * numParameters,
+    }))
+    const myBindGroup = this.initBindGroup(
+      this.u_s_s_s_s_Layout, 
+      [myUniformBuffer, weightsBuffer, mMemoryBuffer, vMemoryBuffer, totalGradientsBuffer]
+    );
+
+    return {
+      passes: [
+        ...copyOps,
+        {
+          flag: "compute",
+          pipeline: myPipeline,
+          groups: [myBindGroup],
+          workgroups: { x: wgSize(numParameters, 128), y: 1, z: 1 },
         }
       ]
     }

@@ -1,3 +1,9 @@
-version https://git-lfs.github.com/spec/v1
-oid sha256:68125bf8d6d60d4f19cf4cd5b69b9fe6ec2f158acf0f39588226d0ecde6f9ba9
-size 120
+{
+  "n_layer": 4,
+  "n_head": 4,
+  "n_embd": 128,
+  "n_ctx": 64,
+  "bias": true,
+  "vocab_size": 72,
+  "dropout": 0.0
+}
